@@ -1,0 +1,11 @@
+name = "sleeper-fixture"
+repo_url = "https://example.com/sleeper"
+version = "0.0.1"
+mode = "native"
+start_command = ["python3", "tests/fixtures/sleeper_agent.py", "tests/sleeper_workdir", "0.2"]
+workdir = "tests/sleeper_workdir"
+
+[healthcheck]
+type = "file"
+value = "tests/sleeper_workdir/healthy"
+timeout_sec = 10
