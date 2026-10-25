@@ -13,7 +13,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from bench.sampler import read_pss_kb, read_rss_kb, read_mem_available_kb, kb_to_mb
+from bench.sampler import (
+    read_pss_kb,
+    read_rss_kb,
+    read_mem_available_kb,
+    kb_to_mb,
+    read_memory_peak_bytes,
+    read_cgroup_cpu_stat,
+    read_cgroup_memory_events,
+    bytes_to_mb,
+    cpu_sec_from_cgroup,
+)
 
 
 # All fields from METHODOLOGY.md section 7 — never omit, use null for missing
@@ -101,6 +111,8 @@ def _run_single_repeat(
     repeat_idx: int,
 ) -> dict[str, Any]:
     """Execute one repeat of scenario A. Returns metrics dict."""
+    # Cgroup path for agent; scenario may define it for fixtures
+    cgroup_path = scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path") or "agent"
     duration_s = scenario_def.get("duration_sec", 10)
     sample_interval = scenario_def.get("sample_interval_sec", 1)
     hc = agent_desc.get("healthcheck", {})
@@ -193,10 +205,23 @@ def _run_single_repeat(
     # Compute metrics
     pss_median = statistics.median(pss_samples) if pss_samples else None
     rss_peak = max(rss_samples) if rss_samples else None
-    ram_peak = max(
-        (pss_median or 0),
-        (rss_peak or 0),
-    ) or None
+
+    # Service RAM peak via cgroup memory.peak (full stack)
+    mem_peak_bytes = read_memory_peak_bytes(cgroup_root, cgroup_path)
+    mem_peak_mb = bytes_to_mb(mem_peak_bytes) if mem_peak_bytes is not None else None
+
+    # Prefer cgroup peak over proc RSS peak
+    ram_peak = mem_peak_mb
+    if ram_peak is None:
+        ram_peak = max((pss_median or 0), (rss_peak or 0)) or None
+
+    # CPU seconds from cgroup
+    cpu_stat = read_cgroup_cpu_stat(cgroup_root, cgroup_path)
+    cpu_sec = cpu_sec_from_cgroup(cpu_stat)
+
+    # OOM counters from cgroup memory.events
+    mem_events = read_cgroup_memory_events(cgroup_root, cgroup_path)
+    oom_count = mem_events.get("oom") if mem_events else None
 
     return {
         "repeat": repeat_idx,
@@ -209,6 +234,10 @@ def _run_single_repeat(
         "success": healthy,
         "pss_samples": pss_samples,
         "rss_samples": rss_samples,
+        "cpu_sec": cpu_sec,
+        "oom_count": oom_count,
+        "cgroup_mem_peak_mb": mem_peak_mb,
+        "cgroup_path": cgroup_path,
     }
 
 
@@ -282,17 +311,35 @@ def cmd_run(args: Any) -> int:
     record["duration_sec"] = primary["duration_sec"]
     record["ram_pss_mb_median"] = primary["ram_pss_mb_median"]
     record["ram_peak_mb"] = primary["ram_peak_mb"]
-    record["cpu_sec"] = None  # Not measured in scenario A fixture
+    record["cpu_sec"] = primary.get("cpu_sec")
     record["startup_ms"] = primary["startup_ms"]
     record["latency_p50_ms"] = None  # Scenario A has no requests
     record["latency_p95_ms"] = None
     record["success_count"] = sum(1 for r in repeat_results if r["success"])
     record["error_count"] = sum(1 for r in repeat_results if not r["success"])
-    record["oom_count"] = 0
+
+    # Aggregate OOM count from repeats
+    oom_values = [r.get("oom_count") for r in repeat_results if r.get("oom_count") is not None]
+    record["oom_count"] = sum(oom_values) if oom_values else 0
+
+    # Build machine-readable notes block with extra metrics
+    extra_notes = []
+    if primary.get("cgroup_path"):
+        extra_notes.append(f"cgroup_path={primary['cgroup_path']}")
+    # Disk metrics placeholder - not implemented yet, leave null
+    extra_notes.append("disk_one_time_mb=null")
+    extra_notes.append("disk_growth_mb=null")
+    extra_notes.append("swap_in_pages=null")
+    extra_notes.append("swap_out_pages=null")
+    # Monitor self-cost recorded separately via notes
+    extra_notes.append("monitor_self_cost_ram_peak_mb=null")
+    extra_notes.append("monitor_self_cost_cpu_sec=null")
+
     record["notes"] = (
         f"repeats={num_repeats}, "
         f"startup_ms_variance={startup_variance}, "
-        f"pss_mb_variance={pss_variance}"
+        f"pss_mb_variance={pss_variance}, "
+        f"{'; '.join(extra_notes)}"
     )
     record["config_ref"] = str(scenario_path)
 

@@ -5,3 +5,4 @@ repeats = 3
 # Fixture-only: sample proc files under PID 1000 (tests/fixtures/proc/1000) so
 # CLI tests assert on known values. Real agents never set this.
 proc_pid_override = 1000
+cgroup_path = "v2/agent"

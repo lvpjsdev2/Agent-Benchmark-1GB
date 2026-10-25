@@ -61,6 +61,8 @@ def _run_bench(workdir: Path, runs_dir: Path) -> tuple[int, str, str]:
         str(SCENARIO),
         "--proc-root",
         str(PROC_ROOT),
+        "--cgroup-root",
+        str(FIXTURES / "cgroup"),
         "--runs-dir",
         str(runs_dir),
     ]
@@ -96,11 +98,16 @@ def test_run_produces_record_with_all_section7_fields(tmp_path):
     assert record["success_count"] == 3
     assert record["error_count"] == 0
     assert record["oom_count"] == 0
-    assert record["ram_pss_mb_median"] == 15.0
+    # ram_peak_mb should come from cgroup memory.peak: 20971520 bytes = 20 MiB
     assert record["ram_peak_mb"] == 20.0
+    # cpu_sec from cgroup cpu.stat usage_usec 5000000 = 5 sec
+    assert record["cpu_sec"] == 5.0
+    assert record["ram_pss_mb_median"] == 15.0
     assert record["host_profile"]["mem_available_mb_baseline"] == 512.0
     assert record["startup_ms"] is not None and record["startup_ms"] > 0
     assert "variance" in record["notes"]
+    # Notes should contain cgroup_path
+    assert "cgroup_path=v2/agent" in record["notes"]
 
 
 def test_repeats_and_variance_recorded(tmp_path):
@@ -162,3 +169,71 @@ def test_cli_help_exits_zero():
     )
     assert proc.returncode == 0
     assert "run" in proc.stdout
+
+
+def _run_bench_with_cgroup(workdir: Path, runs_dir: Path, cgroup_root: Path) -> tuple[int, str, str]:
+    desc = _write_descriptor(workdir)
+    cmd = [
+        sys.executable,
+        "-m",
+        "bench",
+        "run",
+        str(desc),
+        str(SCENARIO),
+        "--proc-root",
+        str(PROC_ROOT),
+        "--cgroup-root",
+        str(cgroup_root),
+        "--runs-dir",
+        str(runs_dir),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=ROOT,
+    )
+    stdout, stderr = proc.communicate(timeout=120)
+    return proc.returncode, stdout, stderr
+
+
+def test_cgroup_fixture_yields_correct_ram_peak_and_cpu_sec(tmp_path):
+    runs = tmp_path / "runs"
+    cgroup_root = FIXTURES / "cgroup"
+    code, out, err = _run_bench_with_cgroup(tmp_path, runs, cgroup_root)
+    assert code == 0, f"exit {code}: {err}"
+    record = json.loads(list(runs.glob("*/record.jsonl"))[0].read_text())
+    # memory.peak 20971520 bytes = 20 MiB
+    assert record["ram_peak_mb"] == 20.0
+    # cpu.stat usage_usec 5000000 => 5 sec
+    assert record["cpu_sec"] == 5.0
+    assert record["oom_count"] == 0
+
+
+def test_swap_counters_absent_fields_are_null(tmp_path):
+    runs = tmp_path / "runs"
+    # Use cgroup root without swap files; notes should show swap_in/pages null
+    cgroup_root = FIXTURES / "cgroup"
+    code, out, err = _run_bench_with_cgroup(tmp_path, runs, cgroup_root)
+    assert code == 0, f"exit {code}: {err}"
+    record = json.loads(list(runs.glob("*/record.jsonl"))[0].read_text())
+    # Swap fields are recorded in notes as null, not zero
+    assert "swap_in_pages=null" in record["notes"]
+    assert "swap_out_pages=null" in record["notes"]
+
+
+def test_monitor_self_cost_separate_from_agent_metrics(tmp_path):
+    # This test verifies that monitor self-cost is recorded separately in notes, not mixed with agent metrics
+    runs = tmp_path / "runs"
+    cgroup_root = FIXTURES / "cgroup"
+    code, out, err = _run_bench_with_cgroup(tmp_path, runs, cgroup_root)
+    assert code == 0, f"exit {code}: {err}"
+    record = json.loads(list(runs.glob("*/record.jsonl"))[0].read_text())
+    notes = record["notes"]
+    # Monitor self-cost fields exist in notes and are not merged into ram_peak_mb/cpu_sec
+    assert "monitor_self_cost_ram_peak_mb=null" in notes
+    assert "monitor_self_cost_cpu_sec=null" in notes
+    # Agent metrics are separate
+    assert record["ram_peak_mb"] == 20.0
+    assert record["cpu_sec"] == 5.0
