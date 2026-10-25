@@ -1,0 +1,14 @@
+name = "scenario_c_real_llm_tasks"
+# One provider + one model, same temperature, max_tokens, system prompt — all from config
+task_count = 4
+repeats_per_task = 5
+repeats = 5
+# Mock LLM config for scenario C (uses mock server when --mock-llm-port provided)
+mock_latency_ms = 100
+# Task definitions (4 tasks, each run 5 times):
+# Task 1: Short verifiable question without tools
+# Task 2: Read a created test file and extract three given values
+# Task 3: Create a JSON summary file in a temp directory with automatic schema validation
+# Task 4: When MCP is supported, call a local harmless echo/add tool as a separate functional test
+# All tasks share the same temperature, max_tokens, system prompt from config
+tool_cycles = 10
