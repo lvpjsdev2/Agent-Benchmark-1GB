@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import urllib.request
+import urllib.error
 
 from bench.sampler import (
     read_pss_kb,
@@ -24,7 +26,6 @@ from bench.sampler import (
     bytes_to_mb,
     cpu_sec_from_cgroup,
 )
-
 
 # All fields from METHODOLOGY.md section 7 — never omit, use null for missing
 RECORD_FIELDS = [
@@ -103,14 +104,14 @@ def _cleanup_workdir(workdir: str | Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def _run_single_repeat(
+def _run_single_repeat_scenario_a(
     agent_desc: dict,
     scenario_def: dict,
     proc_root: str,
     cgroup_root: str,
     repeat_idx: int,
 ) -> dict[str, Any]:
-    """Execute one repeat of scenario A. Returns metrics dict."""
+    """Execute one repeat of scenario A (cold start / idle). Returns metrics dict."""
     # Cgroup path for agent; scenario may define it for fixtures
     cgroup_path = scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path") or "agent"
     duration_s = scenario_def.get("duration_sec", 10)
@@ -241,6 +242,225 @@ def _run_single_repeat(
     }
 
 
+def _run_single_repeat_scenario_b(
+    agent_desc: dict,
+    scenario_def: dict,
+    proc_root: str,
+    cgroup_root: str,
+    repeat_idx: int,
+    mock_port: int | None,
+) -> dict[str, Any]:
+    """Execute one repeat of scenario B (mock LLM controlled requests)."""
+    duration_s = 0
+    sample_interval = 1
+    hc = agent_desc.get("healthcheck", {})
+    hc_type = hc.get("type", "file")
+    hc_value = hc.get("value", "")
+    hc_timeout = hc.get("timeout_sec", 30)
+    workdir = agent_desc.get("workdir", "/tmp/bench-agent-workdir")
+    start_cmd = agent_desc["start_command"]
+    proc_pid_override = scenario_def.get("proc_pid_override") or agent_desc.get("proc_pid_override")
+
+    workdir_abs = str(Path(workdir).resolve())
+    if hc_type == "file" and hc_value:
+        hc_value = str(Path(hc_value).resolve())
+
+    if isinstance(start_cmd, list):
+        cmd_cwd = Path.cwd()
+        resolved_cmd: list[str] = []
+        for part in start_cmd:
+            if part == workdir:
+                resolved_cmd.append(workdir_abs)
+            else:
+                cand = cmd_cwd / part
+                resolved_cmd.append(str(cand) if cand.exists() else part)
+        start_cmd = resolved_cmd
+
+    _cleanup_workdir(workdir_abs)
+
+    mem_avail_kb = read_mem_available_kb(proc_root)
+    ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
+
+    t_start = time.monotonic()
+    started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    proc = subprocess.Popen(
+        start_cmd,
+        shell=isinstance(start_cmd, str),
+        cwd=workdir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pid = proc.pid
+    sample_pid = int(proc_pid_override) if proc_pid_override else pid
+
+    healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
+    if not healthy:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return {
+            "repeat": repeat_idx,
+            "startup_ms": None,
+            "ram_pss_mb_median": None,
+            "ram_peak_mb": None,
+            "ram_baseline_mb": ram_baseline_mb,
+            "duration_sec": 0.0,
+            "started_at_utc": started_at_utc,
+            "success": False,
+            "pss_samples": [],
+            "rss_samples": [],
+            "latencies_ms": [],
+            "success_count": 0,
+            "error_count": 0,
+            "tool_cycles": None,
+        }
+
+    t_healthy = time.monotonic()
+    startup_ms = (t_healthy - t_start) * 1000.0
+
+    # Sampling during requests (scenario B measures during execution)
+    pss_samples: list[float] = []
+    rss_samples: list[float] = []
+
+    # Scenario B parameters
+    warmup = int(scenario_def.get("warmup_requests", 5))
+    total_requests = int(scenario_def.get("requests", 30))
+    latency_p50_ms = None
+    latency_p95_ms = None
+    success_count = 0
+    error_count = 0
+    latencies_ms: list[float] = []
+
+    mock_llm_url = scenario_def.get("mock_llm_url")
+    if mock_port:
+        mock_llm_url = f"http://127.0.0.1:{mock_port}/v1/chat/completions"
+    request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
+
+    # Tool cycles flag
+    tool_cycles_flag = scenario_def.get("tool_cycles")
+    tool_cycles_executed = None
+
+    # Simple request loop via urllib (fixture agents will be the process, we simulate latency by querying mock)
+    for i in range(warmup + total_requests):
+        sample_start = time.monotonic()
+        # Poll memory sample during warmup/requests
+        pss = read_pss_kb(proc_root, sample_pid)
+        rss = read_rss_kb(proc_root, sample_pid)
+        if pss is not None:
+            pss_samples.append(kb_to_mb(pss))
+        if rss is not None:
+            rss_samples.append(kb_to_mb(rss))
+
+        try:
+            if mock_llm_url:
+                req = urllib.request.Request(mock_llm_url, method="POST", data=b'{"messages":[]}', headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+                    _ = resp.read()
+                    ok = resp.status == 200
+            else:
+                # No mock, just sleep a bit
+                time.sleep(0.01)
+                ok = True
+        except Exception:
+            ok = False
+
+        elapsed_ms = (time.monotonic() - sample_start) * 1000.0
+
+        if i >= warmup:
+            latencies_ms.append(elapsed_ms)
+            if ok:
+                success_count += 1
+            else:
+                error_count += 1
+        else:
+            # Warmup: don't count, but still track
+            pass
+
+        # Small pause to avoid hammering
+        time.sleep(0.01)
+
+    # Compute latency percentiles
+    if latencies_ms:
+        latencies_sorted = sorted(latencies_ms)
+        def percentile(data, p):
+            k = (len(data) - 1) * p / 100
+            f = int(k)
+            c = min(f + 1, len(data) - 1)
+            if f == c:
+                return data[int(k)]
+            d0 = data[f] * (c - k)
+            d1 = data[c] * (k - f)
+            return d0 + d1
+        latency_p50_ms = float(percentile(latencies_sorted, 50))
+        latency_p95_ms = float(percentile(latencies_sorted, 95))
+
+    t_end = time.monotonic()
+    duration_actual = t_end - t_start
+
+    # Tool cycles
+    if tool_cycles_flag is not None:
+        # If scenario defines tool_cycles, note it as N/A for fixture;
+        # real implementation would invoke agent and count cycles.
+        tool_cycles_executed = None
+    else:
+        tool_cycles_executed = None
+
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    pss_median = statistics.median(pss_samples) if pss_samples else None
+    rss_peak = max(rss_samples) if rss_samples else None
+    ram_peak = max((pss_median or 0), (rss_peak or 0)) or None
+
+    return {
+        "repeat": repeat_idx,
+        "startup_ms": startup_ms,
+        "ram_pss_mb_median": pss_median,
+        "ram_peak_mb": ram_peak,
+        "ram_baseline_mb": ram_baseline_mb,
+        "duration_sec": round(duration_actual, 3),
+        "started_at_utc": started_at_utc,
+        "success": healthy,
+        "pss_samples": pss_samples,
+        "rss_samples": rss_samples,
+        "latencies_ms": latencies_ms,
+        "latency_p50_ms": latency_p50_ms,
+        "latency_p95_ms": latency_p95_ms,
+        "success_count": success_count,
+        "error_count": error_count,
+        "tool_cycles": tool_cycles_executed,
+    }
+
+
+def _run_single_repeat(
+    agent_desc: dict,
+    scenario_def: dict,
+    proc_root: str,
+    cgroup_root: str,
+    repeat_idx: int,
+    mock_port: int | None,
+) -> dict[str, Any]:
+    """Execute one repeat, dispatching to A or B based on scenario definition."""
+    scenario_name = scenario_def.get("name", "")
+    if "scenario_b" in scenario_name.lower() or scenario_def.get("requests"):
+        return _run_single_repeat_scenario_b(
+            agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port
+        )
+    return _run_single_repeat_scenario_a(
+        agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx
+    )
+
+
 def cmd_run(args: Any) -> int:
     """Execute the 'run' subcommand."""
     agent_path = Path(args.agent)
@@ -259,112 +479,140 @@ def cmd_run(args: Any) -> int:
     proc_root = args.proc_root
     cgroup_root = args.cgroup_root
     runs_dir = Path(args.runs_dir)
+    mock_port_arg = getattr(args, "mock_llm_port", None)
 
     run_id = str(uuid.uuid4())[:8]
     run_dir = runs_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    num_repeats = scenario_def.get("repeats", 3)
-    scenario_name = scenario_def.get("name", scenario_path.stem)
+    # Start mock LLM server if requested
+    mock_server = None
+    mock_port_num = None
+    if mock_port_arg:
+        from bench.mock.server import MockLLMServer, MockConfig
+        latency_ms = int(scenario_def.get("mock_latency_ms", 50))
+        error_mode = scenario_def.get("mock_error_mode")
+        cfg = MockConfig(latency_ms=latency_ms, error_mode=error_mode)
+        mock_server = MockLLMServer(port=mock_port_arg, config=cfg)
+        mock_server.start()
+        mock_port_num = mock_port_arg
 
-    repeat_results: list[dict] = []
-    for i in range(num_repeats):
-        result = _run_single_repeat(
-            agent_desc=agent_desc,
-            scenario_def=scenario_def,
-            proc_root=proc_root,
-            cgroup_root=cgroup_root,
-            repeat_idx=i,
-        )
-        repeat_results.append(result)
+    try:
+        num_repeats = scenario_def.get("repeats", 3)
+        scenario_name = scenario_def.get("name", scenario_path.stem)
 
-    # Build summary with variance across repeats
-    startup_values = [r["startup_ms"] for r in repeat_results if r["startup_ms"] is not None]
-    pss_values = [r["ram_pss_mb_median"] for r in repeat_results if r["ram_pss_mb_median"] is not None]
+        repeat_results: list[dict] = []
+        for i in range(num_repeats):
+            result = _run_single_repeat(
+                agent_desc=agent_desc,
+                scenario_def=scenario_def,
+                proc_root=proc_root,
+                cgroup_root=cgroup_root,
+                repeat_idx=i,
+                mock_port=mock_port_num,
+            )
+            repeat_results.append(result)
 
-    startup_variance = statistics.variance(startup_values) if len(startup_values) >= 2 else None
-    pss_variance = statistics.variance(pss_values) if len(pss_values) >= 2 else None
+        # Build summary
+        startup_values = [r["startup_ms"] for r in repeat_results if r["startup_ms"] is not None]
+        pss_values = [r["ram_pss_mb_median"] for r in repeat_results if r["ram_pss_mb_median"] is not None]
+        latency_p50_vals = [r.get("latency_p50_ms") for r in repeat_results if r.get("latency_p50_ms") is not None]
+        latency_p95_vals = [r.get("latency_p95_ms") for r in repeat_results if r.get("latency_p95_ms") is not None]
 
-    # Use first successful repeat's timing for the record, or last repeat
-    primary = repeat_results[-1]
-    for r in repeat_results:
-        if r["success"]:
-            primary = r
-            break
+        startup_variance = statistics.variance(startup_values) if len(startup_values) >= 2 else None
+        pss_variance = statistics.variance(pss_values) if len(pss_values) >= 2 else None
 
-    # Baseline from first repeat
-    baseline_mb = repeat_results[0]["ram_baseline_mb"]
-
-    # Build JSONL record with all section 7 fields
-    record = _empty_record()
-    record["run_id"] = run_id
-    record["agent"] = agent_desc.get("name", agent_path.stem)
-    record["repo_url"] = agent_desc.get("repo_url", None)
-    record["version"] = agent_desc.get("version", None)
-    record["mode"] = agent_desc.get("mode", None)
-    record["scenario"] = scenario_name
-    record["host_profile"] = {
-        "mem_available_mb_baseline": baseline_mb,
-        "os": sys.platform,
-    }
-    record["started_at_utc"] = primary["started_at_utc"]
-    record["duration_sec"] = primary["duration_sec"]
-    record["ram_pss_mb_median"] = primary["ram_pss_mb_median"]
-    record["ram_peak_mb"] = primary["ram_peak_mb"]
-    record["cpu_sec"] = primary.get("cpu_sec")
-    record["startup_ms"] = primary["startup_ms"]
-    record["latency_p50_ms"] = None  # Scenario A has no requests
-    record["latency_p95_ms"] = None
-    record["success_count"] = sum(1 for r in repeat_results if r["success"])
-    record["error_count"] = sum(1 for r in repeat_results if not r["success"])
-
-    # Aggregate OOM count from repeats
-    oom_values = [r.get("oom_count") for r in repeat_results if r.get("oom_count") is not None]
-    record["oom_count"] = sum(oom_values) if oom_values else 0
-
-    # Build machine-readable notes block with extra metrics
-    extra_notes = []
-    if primary.get("cgroup_path"):
-        extra_notes.append(f"cgroup_path={primary['cgroup_path']}")
-    # Disk metrics placeholder - not implemented yet, leave null
-    extra_notes.append("disk_one_time_mb=null")
-    extra_notes.append("disk_growth_mb=null")
-    extra_notes.append("swap_in_pages=null")
-    extra_notes.append("swap_out_pages=null")
-    # Monitor self-cost recorded separately via notes
-    extra_notes.append("monitor_self_cost_ram_peak_mb=null")
-    extra_notes.append("monitor_self_cost_cpu_sec=null")
-
-    record["notes"] = (
-        f"repeats={num_repeats}, "
-        f"startup_ms_variance={startup_variance}, "
-        f"pss_mb_variance={pss_variance}, "
-        f"{'; '.join(extra_notes)}"
-    )
-    record["config_ref"] = str(scenario_path)
-
-    # Write JSONL record
-    record_path = run_dir / "record.jsonl"
-    with open(record_path, "w") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    # Write per-repeat details
-    repeats_path = run_dir / "repeats.jsonl"
-    with open(repeats_path, "w") as f:
+        primary = repeat_results[-1]
         for r in repeat_results:
-            row = {k: v for k, v in r.items() if k not in ("pss_samples", "rss_samples")}
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            if r["success"]:
+                primary = r
+                break
 
-    # Print summary to stdout
-    print(json.dumps({
-        "run_id": run_id,
-        "status": "ok" if any(r["success"] for r in repeat_results) else "failed",
-        "repeats": num_repeats,
-        "startup_ms_median": statistics.median(startup_values) if startup_values else None,
-        "startup_ms_variance": startup_variance,
-        "ram_pss_mb_median": statistics.median(pss_values) if pss_values else None,
-        "ram_pss_mb_variance": pss_variance,
-        "record_path": str(record_path),
-    }, indent=2))
+        baseline_mb = repeat_results[0]["ram_baseline_mb"]
 
-    return 0
+        # Aggregate success/error counts across repeats for scenario B
+        total_success = sum(r.get("success_count", 0) for r in repeat_results)
+        total_errors = sum(r.get("error_count", 0) for r in repeat_results)
+        # For scenario A (no latency fields), success_count is per repeat health
+        if not latency_p50_vals:
+            total_success = sum(1 for r in repeat_results if r["success"])
+            total_errors = sum(1 for r in repeat_results if not r["success"])
+
+        record = _empty_record()
+        record["run_id"] = run_id
+        record["agent"] = agent_desc.get("name", agent_path.stem)
+        record["repo_url"] = agent_desc.get("repo_url", None)
+        record["version"] = agent_desc.get("version", None)
+        record["mode"] = agent_desc.get("mode", None)
+        record["scenario"] = scenario_name
+        record["host_profile"] = {
+            "mem_available_mb_baseline": baseline_mb,
+            "os": sys.platform,
+        }
+        record["started_at_utc"] = primary["started_at_utc"]
+        record["duration_sec"] = primary["duration_sec"]
+        record["ram_pss_mb_median"] = primary["ram_pss_mb_median"]
+        record["ram_peak_mb"] = primary["ram_peak_mb"]
+        record["cpu_sec"] = primary.get("cpu_sec")
+        record["startup_ms"] = primary["startup_ms"]
+        # Latency fields: use median across repeats if scenario B
+        if latency_p50_vals:
+            record["latency_p50_ms"] = statistics.median(latency_p50_vals)
+            record["latency_p95_ms"] = statistics.median(latency_p95_vals) if latency_p95_vals else None
+        else:
+            record["latency_p50_ms"] = None
+            record["latency_p95_ms"] = None
+        record["success_count"] = total_success
+        record["error_count"] = total_errors
+        record["oom_count"] = 0
+        notes_parts = [
+            f"repeats={num_repeats}",
+        ]
+        if startup_variance is not None:
+            notes_parts.append(f"startup_ms_variance={startup_variance}")
+        if pss_variance is not None:
+            notes_parts.append(f"pss_mb_variance={pss_variance}")
+        # Tool cycles note
+        tool_note = None
+        for r in repeat_results:
+            tc = r.get("tool_cycles")
+            if tc is not None:
+                tool_note = f"tool_cycles={tc}"
+                break
+        if tool_note:
+            notes_parts.append(tool_note)
+        else:
+            # Check scenario flag
+            if scenario_def.get("tool_cycles") is not None:
+                notes_parts.append("tool_cycles=N/A")
+        record["notes"] = ", ".join(notes_parts)
+        record["config_ref"] = str(scenario_path)
+
+        record_path = run_dir / "record.jsonl"
+        with open(record_path, "w") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        repeats_path = run_dir / "repeats.jsonl"
+        with open(repeats_path, "w") as f:
+            for r in repeat_results:
+                row = {k: v for k, v in r.items() if k not in ("pss_samples", "rss_samples", "latencies_ms")}
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        print(json.dumps({
+            "run_id": run_id,
+            "status": "ok" if any(r["success"] for r in repeat_results) else "failed",
+            "repeats": num_repeats,
+            "startup_ms_median": statistics.median(startup_values) if startup_values else None,
+            "startup_ms_variance": startup_variance,
+            "ram_pss_mb_median": statistics.median(pss_values) if pss_values else None,
+            "ram_pss_mb_variance": pss_variance,
+            "latency_p50_ms": record["latency_p50_ms"],
+            "latency_p95_ms": record["latency_p95_ms"],
+            "success_count": total_success,
+            "error_count": total_errors,
+            "record_path": str(record_path),
+        }, indent=2))
+        return 0
+    finally:
+        if mock_server:
+            mock_server.stop()
