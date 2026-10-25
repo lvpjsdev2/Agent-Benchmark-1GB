@@ -16,6 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--proc-root", default="/proc", help="Root path for /proc (default: /proc)")
     run_p.add_argument("--cgroup-root", default="/sys/fs/cgroup", help="Root path for cgroup v2 sysfs")
     run_p.add_argument("--runs-dir", default="runs", help="Directory for run output (default: runs)")
+    run_p.add_argument("--mock-llm-port", type=int, help="Start mock LLM server on this port (OpenAI compatible)")
 
     return parser
 
