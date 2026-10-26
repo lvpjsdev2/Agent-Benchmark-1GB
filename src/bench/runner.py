@@ -1016,8 +1016,52 @@ def _build_run_plan(
         "cgroup_root": args.cgroup_root,
         "runs_dir": str(args.runs_dir),
         "docker_bin": getattr(args, "docker_bin", None),
+        "docker_image": agent_desc.get("image") if agent_desc.get("mode") == "docker" else None,
+        "docker_memory_limit": scenario_def.get("docker_memory_limit"),
+        "docker_cpu_limit": scenario_def.get("docker_cpu_limit"),
     }
     return plan
+
+
+def _validate_docker_descriptor(agent_desc: dict) -> str | None:
+    """Validate a mode=docker descriptor (ticket #20). None when OK / not docker."""
+    if agent_desc.get("mode") != "docker":
+        return None
+    image = agent_desc.get("image")
+    if not image:
+        return "docker descriptor requires 'image'"
+    if "@sha256:" not in str(image):
+        return "docker image must be digest-pinned (repo@sha256:digest)"
+    for a in agent_desc.get("docker_args", []) or []:
+        if "--privileged" in str(a):
+            return "privileged containers are not allowed"
+        if "docker.sock" in str(a):
+            return "mounting docker.sock is not allowed"
+        if str(a) in ("--network", "--net"):
+            return "use --network=<value> form; host network is not allowed"
+        if str(a) in ("--network=host", "--net=host"):
+            return "host network is not allowed"
+    return None
+
+
+def _docker_run_flags(scenario_def: dict, run_id: str, agent_desc: dict) -> list[str]:
+    """Uniform, hardened docker run flags (identical limits for all candidates)."""
+    flags = [
+        "--rm",
+        f"--name=bench-{run_id}",
+        "--network=bridge",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--pids-limit=256",
+    ]
+    mem = scenario_def.get("docker_memory_limit")
+    if mem:
+        flags.append(f"--memory={mem}")
+    cpus = scenario_def.get("docker_cpu_limit")
+    if cpus:
+        flags.append(f"--cpus={cpus}")
+    flags.extend(agent_desc.get("docker_args", []) or [])
+    return flags
 
 
 def cmd_run(args: Any) -> int:
@@ -1034,6 +1078,11 @@ def cmd_run(args: Any) -> int:
 
     agent_desc = _load_toml(agent_path)
     scenario_def = _load_toml(scenario_path)
+
+    docker_error = _validate_docker_descriptor(agent_desc)
+    if docker_error:
+        print(f"Error: {docker_error}", file=sys.stderr)
+        return 1
 
     # Dry-run (ticket #16): print the plan, spawn nothing, write nothing.
     if getattr(args, "dry_run", False):
@@ -1065,6 +1114,26 @@ def cmd_run(args: Any) -> int:
         mock_port_num = mock_server.start()
 
     try:
+        # Docker mode (ticket #20): image preload is a separate phase before
+        # timing, so it never enters startup_ms; the container command is the
+        # descriptor's start_command appended after the digest-pinned image.
+        docker_image = None
+        if agent_desc.get("mode") == "docker":
+            docker_bin = getattr(args, "docker_bin", "docker")
+            docker_image = agent_desc["image"]
+            pull = subprocess.run(
+                [docker_bin, "pull", docker_image],
+                capture_output=True, text=True, timeout=600,
+            )
+            if pull.returncode != 0:
+                print(f"Error: docker pull failed for {docker_image}: {pull.stderr.strip()}", file=sys.stderr)
+                return 1
+            run_flags = _docker_run_flags(scenario_def, run_id, agent_desc)
+            agent_desc = {
+                **agent_desc,
+                "start_command": [docker_bin, "run", *run_flags, docker_image, *agent_desc["start_command"]],
+            }
+
         num_repeats = scenario_def.get("repeats", 3)
         scenario_name = scenario_def.get("name", scenario_path.stem)
 
@@ -1174,6 +1243,9 @@ def cmd_run(args: Any) -> int:
         # Scenario-specific notes (e.g. scenario D: rss growth, restart state)
         for r in repeat_results:
             notes_parts.extend(r.get("extra_notes") or [])
+        if docker_image:
+            notes_parts.append(f"runtime=docker")
+            notes_parts.append(f"docker_image={docker_image}")
         # Ticket #12 extra metrics: cgroup identity and not-yet-collected values.
         # Missing values are null, never omitted (METHODOLOGY.md §7).
         if primary.get("cgroup_path"):
