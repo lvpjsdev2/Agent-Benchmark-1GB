@@ -15,6 +15,7 @@ from typing import Any
 import urllib.request
 import urllib.error
 
+from bench.sanitize import sanitize_record, SANITIZER_NOTE
 from bench.sampler import (
     read_pss_kb,
     read_rss_kb,
@@ -102,6 +103,17 @@ def _cleanup_workdir(workdir: str | Path) -> None:
     if p.exists():
         shutil.rmtree(p)
     p.mkdir(parents=True, exist_ok=True)
+
+
+def _percentile(data: list[float], p: float) -> float:
+    """Linear-interpolated percentile of a sorted-able list, 0..100."""
+    data_sorted = sorted(data)
+    k = (len(data_sorted) - 1) * p / 100
+    f = int(k)
+    c = min(f + 1, len(data_sorted) - 1)
+    if f == c:
+        return data_sorted[int(k)]
+    return data_sorted[f] * (c - k) + data_sorted[c] * (k - f)
 
 
 def _run_single_repeat_scenario_a(
@@ -386,18 +398,8 @@ def _run_single_repeat_scenario_b(
 
     # Compute latency percentiles
     if latencies_ms:
-        latencies_sorted = sorted(latencies_ms)
-        def percentile(data, p):
-            k = (len(data) - 1) * p / 100
-            f = int(k)
-            c = min(f + 1, len(data) - 1)
-            if f == c:
-                return data[int(k)]
-            d0 = data[f] * (c - k)
-            d1 = data[c] * (k - f)
-            return d0 + d1
-        latency_p50_ms = float(percentile(latencies_sorted, 50))
-        latency_p95_ms = float(percentile(latencies_sorted, 95))
+        latency_p50_ms = float(_percentile(latencies_ms, 50))
+        latency_p95_ms = float(_percentile(latencies_ms, 95))
 
     t_end = time.monotonic()
     duration_actual = t_end - t_start
@@ -442,6 +444,171 @@ def _run_single_repeat_scenario_b(
     }
 
 
+def _resolve_start_cmd(start_cmd: Any, workdir: str, workdir_abs: str) -> Any:
+    """Resolve the script path and workdir argument to absolute paths (list commands only)."""
+    if not isinstance(start_cmd, list):
+        return start_cmd
+    cmd_cwd = Path.cwd()
+    resolved_cmd: list[str] = []
+    for part in start_cmd:
+        if part == workdir:
+            resolved_cmd.append(workdir_abs)
+        else:
+            cand = cmd_cwd / part
+            resolved_cmd.append(str(cand) if cand.exists() else part)
+    return resolved_cmd
+
+
+def _run_single_repeat_scenario_c(
+    agent_desc: dict,
+    scenario_def: dict,
+    proc_root: str,
+    cgroup_root: str,
+    repeat_idx: int,
+    mock_port: int | None,
+) -> dict[str, Any]:
+    """Execute one repeat of scenario C (real LLM tasks, ticket #14).
+
+    Tasks run as requests against the mock LLM server when one is up
+    (mock_port includes 0 = OS-assigned). Without a mock server no request is
+    issued and all tasks are marked unfinished in the result.
+    """
+    task_count = int(scenario_def.get("task_count", 0))
+    repeats_per_task = int(scenario_def.get("repeats_per_task", 0))
+    total_tasks = task_count * repeats_per_task
+
+    hc = agent_desc.get("healthcheck", {})
+    hc_type = hc.get("type", "file")
+    hc_value = hc.get("value", "")
+    hc_timeout = hc.get("timeout_sec", 30)
+    workdir = agent_desc.get("workdir", "/tmp/bench-agent-workdir")
+    start_cmd = _resolve_start_cmd(agent_desc["start_command"], workdir, str(Path(workdir).resolve()))
+    proc_pid_override = scenario_def.get("proc_pid_override") or agent_desc.get("proc_pid_override")
+
+    workdir_abs = str(Path(workdir).resolve())
+    if hc_type == "file" and hc_value:
+        hc_value = str(Path(hc_value).resolve())
+
+    _cleanup_workdir(workdir_abs)
+
+    mem_avail_kb = read_mem_available_kb(proc_root)
+    ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
+
+    started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    t_start = time.monotonic()
+
+    proc = subprocess.Popen(
+        start_cmd,
+        shell=isinstance(start_cmd, str),
+        cwd=workdir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    sample_pid = int(proc_pid_override) if proc_pid_override else proc.pid
+
+    healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
+    if not healthy:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return {
+            "repeat": repeat_idx,
+            "startup_ms": None,
+            "ram_pss_mb_median": None,
+            "ram_peak_mb": None,
+            "ram_baseline_mb": ram_baseline_mb,
+            "duration_sec": 0.0,
+            "started_at_utc": started_at_utc,
+            "success": False,
+            "pss_samples": [],
+            "rss_samples": [],
+            "latencies_ms": [],
+            "latency_p50_ms": None,
+            "latency_p95_ms": None,
+            "success_count": 0,
+            "error_count": 0,
+            "unfinished_processes": total_tasks,
+        }
+
+    startup_ms = (time.monotonic() - t_start) * 1000.0
+
+    pss_samples: list[float] = []
+    rss_samples: list[float] = []
+    latencies_ms: list[float] = []
+    success_count = 0
+    error_count = 0
+
+    # With a mock server (port may be 0 = OS-assigned) tasks issue real requests
+    if mock_port is not None:
+        mock_llm_url = f"http://127.0.0.1:{mock_port}/v1/chat/completions"
+        request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
+        for task in range(total_tasks):
+            pss = read_pss_kb(proc_root, sample_pid)
+            rss = read_rss_kb(proc_root, sample_pid)
+            if pss is not None:
+                pss_samples.append(kb_to_mb(pss))
+            if rss is not None:
+                rss_samples.append(kb_to_mb(rss))
+
+            req_start = time.monotonic()
+            try:
+                req = urllib.request.Request(
+                    mock_llm_url, method="POST", data=b'{"messages":[]}',
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+                    _ = resp.read()
+                    ok = resp.status == 200
+            except Exception:
+                ok = False
+            latencies_ms.append((time.monotonic() - req_start) * 1000.0)
+            if ok:
+                success_count += 1
+            else:
+                error_count += 1
+            time.sleep(0.01)
+
+    unfinished = total_tasks - success_count if mock_port is not None else total_tasks
+
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    duration_actual = time.monotonic() - t_start
+    pss_median = statistics.median(pss_samples) if pss_samples else None
+    rss_peak = max(rss_samples) if rss_samples else None
+    ram_peak = max((pss_median or 0), (rss_peak or 0)) or None
+    latency_p50_ms = float(_percentile(latencies_ms, 50)) if latencies_ms else None
+    latency_p95_ms = float(_percentile(latencies_ms, 95)) if latencies_ms else None
+
+    return {
+        "repeat": repeat_idx,
+        "startup_ms": startup_ms,
+        "ram_pss_mb_median": pss_median,
+        "ram_peak_mb": ram_peak,
+        "ram_baseline_mb": ram_baseline_mb,
+        "duration_sec": round(duration_actual, 3),
+        "started_at_utc": started_at_utc,
+        "success": healthy,
+        "pss_samples": pss_samples,
+        "rss_samples": rss_samples,
+        "latencies_ms": latencies_ms,
+        "latency_p50_ms": latency_p50_ms,
+        "latency_p95_ms": latency_p95_ms,
+        "success_count": success_count,
+        "error_count": error_count,
+        "unfinished_processes": unfinished,
+    }
+
+
 def _run_single_repeat(
     agent_desc: dict,
     scenario_def: dict,
@@ -450,10 +617,15 @@ def _run_single_repeat(
     repeat_idx: int,
     mock_port: int | None,
 ) -> dict[str, Any]:
-    """Execute one repeat, dispatching to A or B based on scenario definition."""
+    """Execute one repeat, dispatching to B, C or A based on scenario definition."""
     scenario_name = scenario_def.get("name", "")
     if "scenario_b" in scenario_name.lower() or scenario_def.get("requests"):
         return _run_single_repeat_scenario_b(
+            agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port
+        )
+    # Scenario C is identified by task_count + repeats_per_task (ticket #14)
+    if scenario_def.get("task_count") is not None and scenario_def.get("repeats_per_task") is not None:
+        return _run_single_repeat_scenario_c(
             agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port
         )
     return _run_single_repeat_scenario_a(
@@ -485,17 +657,16 @@ def cmd_run(args: Any) -> int:
     run_dir = runs_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Start mock LLM server if requested
+    # Start mock LLM server if requested (port 0 = OS-assigned)
     mock_server = None
     mock_port_num = None
-    if mock_port_arg:
+    if mock_port_arg is not None:
         from bench.mock.server import MockLLMServer, MockConfig
         latency_ms = int(scenario_def.get("mock_latency_ms", 50))
         error_mode = scenario_def.get("mock_error_mode")
         cfg = MockConfig(latency_ms=latency_ms, error_mode=error_mode)
         mock_server = MockLLMServer(port=mock_port_arg, config=cfg)
-        mock_server.start()
-        mock_port_num = mock_port_arg
+        mock_port_num = mock_server.start()
 
     try:
         num_repeats = scenario_def.get("repeats", 3)
@@ -564,10 +735,24 @@ def cmd_run(args: Any) -> int:
             record["latency_p95_ms"] = None
         record["success_count"] = total_success
         record["error_count"] = total_errors
-        record["oom_count"] = 0
+        # Aggregate OOM count from cgroup memory.events across repeats
+        oom_values = [r.get("oom_count") for r in repeat_results if r.get("oom_count") is not None]
+        record["oom_count"] = sum(oom_values) if oom_values else 0
         notes_parts = [
             f"repeats={num_repeats}",
         ]
+        if "task_count" in scenario_def:
+            notes_parts.append(f"task_count={scenario_def['task_count']}")
+        if "repeats_per_task" in scenario_def:
+            notes_parts.append(f"repeats_per_task={scenario_def['repeats_per_task']}")
+        if "task_count" in scenario_def:
+            # Scenario C: unfinished tasks are counted explicitly, even when 0
+            unfinished = sum(int(r.get("unfinished_processes") or 0) for r in repeat_results)
+            notes_parts.append(f"unfinished_processes={unfinished}")
+        else:
+            unfinished = sum(1 for r in repeat_results if not r.get("success", True))
+            if unfinished > 0:
+                notes_parts.append(f"unfinished_processes={unfinished}")
         if startup_variance is not None:
             notes_parts.append(f"startup_ms_variance={startup_variance}")
         if pss_variance is not None:
@@ -585,8 +770,26 @@ def cmd_run(args: Any) -> int:
             # Check scenario flag
             if scenario_def.get("tool_cycles") is not None:
                 notes_parts.append("tool_cycles=N/A")
+        # Ticket #12 extra metrics: cgroup identity and not-yet-collected values.
+        # Missing values are null, never omitted (METHODOLOGY.md §7).
+        if primary.get("cgroup_path"):
+            notes_parts.append(f"cgroup_path={primary['cgroup_path']}")
+        notes_parts.extend([
+            "disk_one_time_mb=null",
+            "disk_growth_mb=null",
+            "swap_in_pages=null",
+            "swap_out_pages=null",
+            "monitor_self_cost_ram_peak_mb=null",
+            "monitor_self_cost_cpu_sec=null",
+        ])
         record["notes"] = ", ".join(notes_parts)
         record["config_ref"] = str(scenario_path)
+
+        # Sanitize all disk-write paths (ticket #16): no secret reaches
+        # record.jsonl or repeats.jsonl raw.
+        record, record_redacted = sanitize_record(record)
+        if record_redacted:
+            record["notes"] = ", ".join(filter(None, [record["notes"], SANITIZER_NOTE]))
 
         record_path = run_dir / "record.jsonl"
         with open(record_path, "w") as f:
@@ -596,6 +799,7 @@ def cmd_run(args: Any) -> int:
         with open(repeats_path, "w") as f:
             for r in repeat_results:
                 row = {k: v for k, v in r.items() if k not in ("pss_samples", "rss_samples", "latencies_ms")}
+                row, _ = sanitize_record(row)
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
         print(json.dumps({
