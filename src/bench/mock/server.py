@@ -57,9 +57,11 @@ class _Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length) if content_length else b""
         # We don't validate body, just accept.
 
+        # counter is a class attribute shared by per-request handler instances;
+        # mutate it via the class or each request would read the initial 0.
         with self.lock:
-            self.counter += 1
-            call_no = self.counter
+            type(self).counter += 1
+            call_no = type(self).counter
 
         cfg = self.config
         # Simulate latency

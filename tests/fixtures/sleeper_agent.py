@@ -40,6 +40,13 @@ def main():
             pass
     state_path.write_text(json.dumps(state))
 
+    # Optional behaviors selected by argv[6] (ticket #15 fixture matrix)
+    behavior = sys.argv[6] if len(sys.argv) > 6 else ""
+    if behavior == "spawn_hung_child":
+        # Detached child that outlives the agent unless killed explicitly
+        import subprocess as _sp
+        _sp.Popen(["sleep", "300"])
+
     # Keep track of child processes
     child_pids = []
 

@@ -699,6 +699,256 @@ def _run_single_repeat_scenario_c(
     }
 
 
+def _child_pids(pid: int) -> list[int]:
+    """Direct children of pid via `ps` (works on macOS and Linux)."""
+    try:
+        out = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,ppid="],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return []
+    children: list[int] = []
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) == pid:
+            children.append(int(parts[0]))
+    return children
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def _run_single_repeat_scenario_d(
+    agent_desc: dict,
+    scenario_def: dict,
+    proc_root: str,
+    cgroup_root: str,
+    repeat_idx: int,
+    mock_port: int | None,
+) -> dict[str, Any]:
+    """Execute one repeat of scenario D: stability and recovery (ticket #15).
+
+    - 100 (configurable) sequential mock requests with a small pause: success/error
+      counts and RSS growth over the series (leak indicator);
+    - agent restart mid-series with test-state preservation check;
+    - error injection (429/500/timeout via mock modes) is recorded, no retries
+      are issued by the harness, timeouts bounded by request_timeout_sec.
+    """
+    total_requests = int(scenario_def.get("requests", 100))
+    pause_ms = float(scenario_def.get("pause_between_ms", 10))
+    restart_after = scenario_def.get("restart_after_requests")
+    test_state_file = scenario_def.get("test_state_file")
+    rss_leak_threshold_mb = float(scenario_def.get("rss_growth_threshold_mb", 1.0))
+    request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
+    api_budget = scenario_def.get("guard_api_request_budget")
+
+    hc = agent_desc.get("healthcheck", {})
+    hc_type = hc.get("type", "file")
+    hc_value = hc.get("value", "")
+    hc_timeout = hc.get("timeout_sec", 30)
+    workdir = agent_desc.get("workdir", "/tmp/bench-agent-workdir")
+    start_cmd = _resolve_start_cmd(agent_desc["start_command"], workdir, str(Path(workdir).resolve()))
+    proc_pid_override = scenario_def.get("proc_pid_override") or agent_desc.get("proc_pid_override")
+
+    workdir_abs = str(Path(workdir).resolve())
+    if hc_type == "file" and hc_value:
+        hc_value = str(Path(hc_value).resolve())
+
+    _cleanup_workdir(workdir_abs)
+
+    mem_avail_kb = read_mem_available_kb(proc_root)
+    ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
+
+    started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    t_start = time.monotonic()
+
+    proc = subprocess.Popen(
+        start_cmd,
+        shell=isinstance(start_cmd, str),
+        cwd=workdir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    sample_pid = int(proc_pid_override) if proc_pid_override else proc.pid
+
+    healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
+    if not healthy:
+        _terminate_proc(proc)
+        return {
+            "repeat": repeat_idx,
+            "startup_ms": None,
+            "ram_pss_mb_median": None,
+            "ram_peak_mb": None,
+            "ram_baseline_mb": ram_baseline_mb,
+            "duration_sec": 0.0,
+            "started_at_utc": started_at_utc,
+            "success": False,
+            "pss_samples": [],
+            "rss_samples": [],
+            "latencies_ms": [],
+            "latency_p50_ms": None,
+            "latency_p95_ms": None,
+            "success_count": 0,
+            "error_count": 0,
+            "unfinished_processes": 0,
+            "extra_notes": [],
+            "guard": _health_guard(),
+        }
+
+    startup_ms = (time.monotonic() - t_start) * 1000.0
+
+    rss_start_kb = read_rss_kb(proc_root, sample_pid)
+    success_count = 0
+    error_count = 0
+    latencies_ms: list[float] = []
+    restart_state: str | None = None
+    guard = None
+    # Children spawned by any agent instance of this repeat; a child orphaned
+    # by the mid-series restart is just as unfinished as one left at the end.
+    seen_children: set[int] = set()
+
+    mock_llm_url = None
+    if mock_port is not None:
+        mock_llm_url = f"http://127.0.0.1:{mock_port}/v1/chat/completions"
+
+    for i in range(total_requests):
+        if proc.poll() is not None:
+            guard = _health_guard()
+            break
+        req_start = time.monotonic()
+        ok = False
+        try:
+            if mock_llm_url:
+                req = urllib.request.Request(
+                    mock_llm_url, method="POST", data=b'{"messages":[]}',
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+                    _ = resp.read()
+                    ok = resp.status == 200
+            else:
+                time.sleep(0.01)
+                ok = True
+        except Exception:
+            ok = False
+        latencies_ms.append((time.monotonic() - req_start) * 1000.0)
+        if ok:
+            success_count += 1
+        else:
+            error_count += 1
+
+        # API budget guard (ticket #16 semantics apply to D too)
+        if api_budget is not None and success_count + error_count >= int(api_budget):
+            guard = _budget_guard(int(api_budget), success_count + error_count)
+            break
+
+        # Mid-series restart with test-state preservation check (ticket #15)
+        if restart_after is not None and (i + 1) == int(restart_after) and test_state_file:
+            state_path = Path(workdir_abs) / test_state_file
+            state_before = None
+            if state_path.exists():
+                try:
+                    state_before = json.loads(state_path.read_text())
+                except Exception:
+                    state_before = None
+            seen_children.update(_child_pids(proc.pid))
+            _terminate_proc(proc)
+            proc = subprocess.Popen(
+                start_cmd,
+                shell=isinstance(start_cmd, str),
+                cwd=workdir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            healthy_again = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
+            restart_state = "lost"
+            if healthy_again and state_path.exists():
+                try:
+                    state_after = json.loads(state_path.read_text())
+                    # start_time is loaded from the existing file by the fixture,
+                    # so equality means the state survived the restart
+                    if state_before is None or state_after.get("start_time") == state_before.get("start_time"):
+                        restart_state = "preserved"
+                except Exception:
+                    restart_state = "lost"
+            if not healthy_again:
+                guard = _health_guard()
+                break
+
+        time.sleep(pause_ms / 1000.0)
+
+    rss_end_kb = read_rss_kb(proc_root, sample_pid)
+    rss_growth_mb = None
+    if rss_start_kb is not None and rss_end_kb is not None:
+        rss_growth_mb = round(kb_to_mb(rss_end_kb) - kb_to_mb(rss_start_kb), 3)
+
+    # Detect unfinished (orphaned) child processes: alive while an agent
+    # instance ran, still alive after the last agent was terminated.
+    seen_children.update(_child_pids(proc.pid))
+    _terminate_proc(proc)
+    unfinished_pids = sorted(p for p in seen_children if _pid_alive(p))
+    # Hygiene for real runs: don't leave hung children behind
+    for p in unfinished_pids:
+        try:
+            os.kill(p, 9)
+        except OSError:
+            pass
+
+    duration_actual = time.monotonic() - t_start
+    latency_p50_ms = float(_percentile(latencies_ms, 50)) if latencies_ms else None
+    latency_p95_ms = float(_percentile(latencies_ms, 95)) if latencies_ms else None
+
+    extra_notes: list[str] = []
+    if rss_growth_mb is not None:
+        extra_notes.append(f"rss_growth_mb={rss_growth_mb}")
+        extra_notes.append(f"rss_leak={'true' if rss_growth_mb > rss_leak_threshold_mb else 'false'}")
+    if restart_state is not None:
+        extra_notes.append(f"restart_state={restart_state}")
+    extra_notes.append(f"mock_error_mode={scenario_def.get('mock_error_mode')}")
+    extra_notes.append(f"unfinished_processes={len(unfinished_pids)}")
+    if unfinished_pids:
+        extra_notes.append("unfinished_pids=" + ",".join(str(p) for p in unfinished_pids))
+
+    return {
+        "repeat": repeat_idx,
+        "startup_ms": startup_ms,
+        "ram_pss_mb_median": None,
+        "ram_peak_mb": None,
+        "ram_baseline_mb": ram_baseline_mb,
+        "duration_sec": round(duration_actual, 3),
+        "started_at_utc": started_at_utc,
+        "success": guard is None,
+        "pss_samples": [],
+        "rss_samples": [],
+        "latencies_ms": latencies_ms,
+        "latency_p50_ms": latency_p50_ms,
+        "latency_p95_ms": latency_p95_ms,
+        "success_count": success_count,
+        "error_count": error_count,
+        "unfinished_processes": len(unfinished_pids),
+        "extra_notes": extra_notes,
+        "guard": guard,
+    }
+
+
 def _run_single_repeat(
     agent_desc: dict,
     scenario_def: dict,
@@ -707,8 +957,13 @@ def _run_single_repeat(
     repeat_idx: int,
     mock_port: int | None,
 ) -> dict[str, Any]:
-    """Execute one repeat, dispatching to B, C or A based on scenario definition."""
+    """Execute one repeat, dispatching to B, C, D or A based on scenario definition."""
     scenario_name = scenario_def.get("name", "")
+    # Scenario D: stability/recovery is identified before B (it also has "requests")
+    if "scenario_d" in scenario_name.lower() or scenario_def.get("restart_after_requests"):
+        return _run_single_repeat_scenario_d(
+            agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port
+        )
     if "scenario_b" in scenario_name.lower() or scenario_def.get("requests"):
         return _run_single_repeat_scenario_b(
             agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port
@@ -801,7 +1056,11 @@ def cmd_run(args: Any) -> int:
         from bench.mock.server import MockLLMServer, MockConfig
         latency_ms = int(scenario_def.get("mock_latency_ms", 50))
         error_mode = scenario_def.get("mock_error_mode")
-        cfg = MockConfig(latency_ms=latency_ms, error_mode=error_mode)
+        cfg = MockConfig(
+            latency_ms=latency_ms,
+            error_mode=error_mode,
+            error_on_call=scenario_def.get("error_on_call"),
+        )
         mock_server = MockLLMServer(port=mock_port_arg, config=cfg)
         mock_port_num = mock_server.start()
 
@@ -912,6 +1171,9 @@ def cmd_run(args: Any) -> int:
             # Check scenario flag
             if scenario_def.get("tool_cycles") is not None:
                 notes_parts.append("tool_cycles=N/A")
+        # Scenario-specific notes (e.g. scenario D: rss growth, restart state)
+        for r in repeat_results:
+            notes_parts.extend(r.get("extra_notes") or [])
         # Ticket #12 extra metrics: cgroup identity and not-yet-collected values.
         # Missing values are null, never omitted (METHODOLOGY.md §7).
         if primary.get("cgroup_path"):
