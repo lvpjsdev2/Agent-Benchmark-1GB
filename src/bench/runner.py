@@ -116,6 +116,66 @@ def _percentile(data: list[float], p: float) -> float:
     return data_sorted[f] * (c - k) + data_sorted[c] * (k - f)
 
 
+# Guard exit codes (ticket #16): distinct codes so an AFK run can be triaged
+# without a human. 0 ok, 1 usage/setup, 2 OOM, 3 MemAvailable, 4 health, 5 API budget.
+GUARD_EXIT_CODES = {
+    "oom": 2,
+    "memavailable": 3,
+    "health": 4,
+    "api_budget": 5,
+}
+
+
+def _evaluate_guards(
+    scenario_def: dict,
+    proc_root: str,
+    cgroup_root: str,
+    cgroup_path: str,
+) -> dict | None:
+    """Return {"code", "reason"} when a configured guard threshold trips, else None.
+
+    Thresholds come from the scenario TOML (ticket #16):
+    guard_oom_threshold, guard_memavailable_min_mb. Health (4) and API budget (5)
+    guards are evaluated at their call sites.
+    """
+    oom_threshold = scenario_def.get("guard_oom_threshold")
+    if oom_threshold is not None:
+        events = read_cgroup_memory_events(cgroup_root, cgroup_path) or {}
+        oom = events.get("oom") or 0
+        if oom >= int(oom_threshold):
+            return {
+                "code": GUARD_EXIT_CODES["oom"],
+                "reason": f"oom_count={oom}>=guard_oom_threshold={oom_threshold}",
+            }
+    min_avail = scenario_def.get("guard_memavailable_min_mb")
+    if min_avail is not None:
+        avail_kb = read_mem_available_kb(proc_root)
+        if avail_kb is not None:
+            avail_mb = kb_to_mb(avail_kb)
+            if avail_mb < float(min_avail):
+                return {
+                    "code": GUARD_EXIT_CODES["memavailable"],
+                    "reason": (
+                        f"memavailable_mb={avail_mb:.0f}<guard_memavailable_min_mb={min_avail}"
+                    ),
+                }
+    return None
+
+
+def _health_guard() -> dict:
+    return {
+        "code": GUARD_EXIT_CODES["health"],
+        "reason": "healthcheck failed (limit reached)",
+    }
+
+
+def _budget_guard(budget: int, issued: int) -> dict:
+    return {
+        "code": GUARD_EXIT_CODES["api_budget"],
+        "reason": f"api_requests={issued}>=guard_api_request_budget={budget}",
+    }
+
+
 def _run_single_repeat_scenario_a(
     agent_desc: dict,
     scenario_def: dict,
@@ -182,10 +242,13 @@ def _run_single_repeat_scenario_a(
     pid = proc.pid
     sample_pid = int(proc_pid_override) if proc_pid_override else pid
 
-    # Wait for healthcheck
+    # Wait for healthcheck; failure is the health guard (exit code 4)
     healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
     t_healthy = time.monotonic()
     startup_ms = (t_healthy - t_start) * 1000.0 if healthy else None
+    guard = None
+    if not healthy:
+        guard = _health_guard()
 
     # Sample PSS/RSS at 1-second intervals
     pss_samples: list[float] = []
@@ -201,6 +264,10 @@ def _run_single_repeat_scenario_a(
             pss_samples.append(kb_to_mb(pss))
         if rss is not None:
             rss_samples.append(kb_to_mb(rss))
+        loop_guard = _evaluate_guards(scenario_def, proc_root, cgroup_root, cgroup_path)
+        if loop_guard:
+            guard = loop_guard
+            break
         time.sleep(sample_interval)
 
     t_end = time.monotonic()
@@ -251,6 +318,7 @@ def _run_single_repeat_scenario_a(
         "oom_count": oom_count,
         "cgroup_mem_peak_mb": mem_peak_mb,
         "cgroup_path": cgroup_path,
+        "guard": guard,
     }
 
 
@@ -330,6 +398,7 @@ def _run_single_repeat_scenario_b(
             "success_count": 0,
             "error_count": 0,
             "tool_cycles": None,
+            "guard": _health_guard(),
         }
 
     t_healthy = time.monotonic()
@@ -357,8 +426,15 @@ def _run_single_repeat_scenario_b(
     tool_cycles_flag = scenario_def.get("tool_cycles")
     tool_cycles_executed = None
 
+    # API budget guard (ticket #16): counted (non-warmup) requests cap
+    api_budget = scenario_def.get("guard_api_request_budget")
+    guard = None
+
     # Simple request loop via urllib (fixture agents will be the process, we simulate latency by querying mock)
     for i in range(warmup + total_requests):
+        if proc.poll() is not None:
+            guard = _health_guard()
+            break
         sample_start = time.monotonic()
         # Poll memory sample during warmup/requests
         pss = read_pss_kb(proc_root, sample_pid)
@@ -389,6 +465,9 @@ def _run_single_repeat_scenario_b(
                 success_count += 1
             else:
                 error_count += 1
+            if api_budget is not None and success_count + error_count >= int(api_budget):
+                guard = _budget_guard(int(api_budget), success_count + error_count)
+                break
         else:
             # Warmup: don't count, but still track
             pass
@@ -441,6 +520,7 @@ def _run_single_repeat_scenario_b(
         "success_count": success_count,
         "error_count": error_count,
         "tool_cycles": tool_cycles_executed,
+        "guard": guard,
     }
 
 
@@ -532,6 +612,7 @@ def _run_single_repeat_scenario_c(
             "success_count": 0,
             "error_count": 0,
             "unfinished_processes": total_tasks,
+            "guard": _health_guard(),
         }
 
     startup_ms = (time.monotonic() - t_start) * 1000.0
@@ -541,12 +622,17 @@ def _run_single_repeat_scenario_c(
     latencies_ms: list[float] = []
     success_count = 0
     error_count = 0
+    api_budget = scenario_def.get("guard_api_request_budget")
+    guard = None
 
     # With a mock server (port may be 0 = OS-assigned) tasks issue real requests
     if mock_port is not None:
         mock_llm_url = f"http://127.0.0.1:{mock_port}/v1/chat/completions"
         request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
         for task in range(total_tasks):
+            if proc.poll() is not None:
+                guard = _health_guard()
+                break
             pss = read_pss_kb(proc_root, sample_pid)
             rss = read_rss_kb(proc_root, sample_pid)
             if pss is not None:
@@ -570,6 +656,9 @@ def _run_single_repeat_scenario_c(
                 success_count += 1
             else:
                 error_count += 1
+            if api_budget is not None and success_count + error_count >= int(api_budget):
+                guard = _budget_guard(int(api_budget), success_count + error_count)
+                break
             time.sleep(0.01)
 
     unfinished = total_tasks - success_count if mock_port is not None else total_tasks
@@ -606,6 +695,7 @@ def _run_single_repeat_scenario_c(
         "success_count": success_count,
         "error_count": error_count,
         "unfinished_processes": unfinished,
+        "guard": guard,
     }
 
 
@@ -633,6 +723,48 @@ def _run_single_repeat(
     )
 
 
+def _build_run_plan(
+    agent_path: Path,
+    scenario_path: Path,
+    agent_desc: dict,
+    scenario_def: dict,
+    args: Any,
+) -> dict:
+    """Execution plan for --dry-run: everything that would run, nothing executed."""
+    plan = {
+        "dry_run": True,
+        "agent": agent_desc.get("name", agent_path.stem),
+        "agent_descriptor": str(agent_path),
+        "mode": agent_desc.get("mode", None),
+        "start_command": agent_desc.get("start_command"),
+        "workdir": agent_desc.get("workdir"),
+        "healthcheck": agent_desc.get("healthcheck"),
+        "scenario": scenario_def.get("name", scenario_path.stem),
+        "scenario_definition": str(scenario_path),
+        "repeats": scenario_def.get("repeats", 3),
+        "requests": scenario_def.get("requests"),
+        "warmup_requests": scenario_def.get("warmup_requests"),
+        "task_count": scenario_def.get("task_count"),
+        "repeats_per_task": scenario_def.get("repeats_per_task"),
+        "mock_llm": {
+            "requested": getattr(args, "mock_llm_port", None) is not None,
+            "port": getattr(args, "mock_llm_port", None),
+            "latency_ms": scenario_def.get("mock_latency_ms"),
+            "error_mode": scenario_def.get("mock_error_mode"),
+        },
+        "guards": {
+            "oom_threshold": scenario_def.get("guard_oom_threshold"),
+            "memavailable_min_mb": scenario_def.get("guard_memavailable_min_mb"),
+            "api_request_budget": scenario_def.get("guard_api_request_budget"),
+        },
+        "proc_root": args.proc_root,
+        "cgroup_root": args.cgroup_root,
+        "runs_dir": str(args.runs_dir),
+        "docker_bin": getattr(args, "docker_bin", None),
+    }
+    return plan
+
+
 def cmd_run(args: Any) -> int:
     """Execute the 'run' subcommand."""
     agent_path = Path(args.agent)
@@ -647,6 +779,11 @@ def cmd_run(args: Any) -> int:
 
     agent_desc = _load_toml(agent_path)
     scenario_def = _load_toml(scenario_path)
+
+    # Dry-run (ticket #16): print the plan, spawn nothing, write nothing.
+    if getattr(args, "dry_run", False):
+        print(json.dumps(_build_run_plan(agent_path, scenario_path, agent_desc, scenario_def, args), indent=2))
+        return 0
 
     proc_root = args.proc_root
     cgroup_root = args.cgroup_root
@@ -673,6 +810,7 @@ def cmd_run(args: Any) -> int:
         scenario_name = scenario_def.get("name", scenario_path.stem)
 
         repeat_results: list[dict] = []
+        aborted_guard = None
         for i in range(num_repeats):
             result = _run_single_repeat(
                 agent_desc=agent_desc,
@@ -683,6 +821,10 @@ def cmd_run(args: Any) -> int:
                 mock_port=mock_port_num,
             )
             repeat_results.append(result)
+            if result.get("guard"):
+                # Guard trip (ticket #16): stop the run, keep collected records
+                aborted_guard = result["guard"]
+                break
 
         # Build summary
         startup_values = [r["startup_ms"] for r in repeat_results if r["startup_ms"] is not None]
@@ -774,6 +916,8 @@ def cmd_run(args: Any) -> int:
         # Missing values are null, never omitted (METHODOLOGY.md §7).
         if primary.get("cgroup_path"):
             notes_parts.append(f"cgroup_path={primary['cgroup_path']}")
+        if aborted_guard:
+            notes_parts.append(f"aborted=guard{aborted_guard['code']}:{aborted_guard['reason']}")
         notes_parts.extend([
             "disk_one_time_mb=null",
             "disk_growth_mb=null",
@@ -804,8 +948,9 @@ def cmd_run(args: Any) -> int:
 
         print(json.dumps({
             "run_id": run_id,
-            "status": "ok" if any(r["success"] for r in repeat_results) else "failed",
-            "repeats": num_repeats,
+            "status": "aborted" if aborted_guard else ("ok" if any(r["success"] for r in repeat_results) else "failed"),
+            "guard": aborted_guard,
+            "repeats": len(repeat_results),
             "startup_ms_median": statistics.median(startup_values) if startup_values else None,
             "startup_ms_variance": startup_variance,
             "ram_pss_mb_median": statistics.median(pss_values) if pss_values else None,
@@ -816,7 +961,7 @@ def cmd_run(args: Any) -> int:
             "error_count": total_errors,
             "record_path": str(record_path),
         }, indent=2))
-        return 0
+        return aborted_guard["code"] if aborted_guard else 0
     finally:
         if mock_server:
             mock_server.stop()
