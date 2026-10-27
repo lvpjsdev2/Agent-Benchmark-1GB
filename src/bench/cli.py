@@ -18,6 +18,7 @@ exit codes:
   3  guard: MemAvailable below minimum
   4  guard: health lost (failed healthchecks reached limit)
   5  guard: API budget exceeded (requests/tokens)
+  6  candidate unavailable (install_failed: not launchable in this mode)
 """
 
 
@@ -38,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--cgroup-root", default="/sys/fs/cgroup", help="Root path for cgroup v2 sysfs")
     run_p.add_argument("--runs-dir", default="runs", help="Directory for run output (default: runs)")
     run_p.add_argument("--mock-llm-port", type=int, help="Start mock LLM server on this port (OpenAI compatible)")
+    run_p.add_argument("--start-attempts", type=int, default=3, help="Start attempts before a failed start is recorded (default: 3, ticket #29)")
     run_p.add_argument("--dry-run", action="store_true", help="Print execution plan without running anything")
     run_p.add_argument("--docker-bin", default="docker", help="Docker CLI binary (or fixture stub) for mode=docker descriptors")
 

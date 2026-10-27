@@ -121,6 +121,51 @@ def test_native_and_docker_rows_are_separate(tmp_path):
     assert "45" in docker_row and "45" not in native_row
 
 
+def test_start_failures_render_in_limitations_section(tmp_path):
+    """Ticket #29: a candidate that never came up is listed with its reason."""
+    runs = tmp_path / "runs"
+    _write_record(runs, "run-attempts", _base_record(
+        run_id="11111111",
+        notes="repeats=3, start_attempts_used=3, "
+              "aborted=guard4:healthcheck failed after 3 start attempt(s), "
+              "disk_one_time_mb=null",
+        ram_pss_mb_median=None, ram_peak_mb=None, cpu_sec=None, startup_ms=None,
+        success_count=0, error_count=3,
+    ))
+    _write_record(runs, "run-pull", _base_record(
+        run_id="22222222", agent="gamma-agent", mode="docker",
+        # Real install_failed records carry no host_profile: the report must
+        # still generate instead of crashing on the missing baseline.
+        host_profile=None,
+        # A comma inside the reason must survive the notes parsing.
+        notes="install_failed=docker_pull_failed: manifest unknown, exit 1, "
+              "runtime=docker, docker_image=ghcr.io/example/agent@sha256:abc",
+        success_count=0, error_count=0,
+    ))
+    _write_record(runs, "run-oom", _base_record(
+        run_id="44444444", agent="delta-agent",
+        notes="repeats=1, aborted=guard2:oom_count=2>=guard_oom_threshold=1, "
+              "disk_one_time_mb=null",
+    ))
+    _write_record(runs, "run-ok", _base_record(run_id="33333333"))
+    out = tmp_path / "report.md"
+    code, _, stderr = _run_report(runs, out)
+    assert code == 0, stderr
+    section = out.read_text().split("## Ограничения результата")[1].split("## Выводы")[0]
+    assert "- Какие проекты не запустились и почему:" in section
+    assert (
+        "alpha-agent (native, run 11111111, scenario_a_cold_start): "
+        "healthcheck failed after 3 start attempt(s) (guard 4)" in section
+    )
+    assert (
+        "gamma-agent (docker, run 22222222, scenario_a_cold_start): "
+        "install_failed=docker_pull_failed: manifest unknown, exit 1 (guard 6)" in section
+    )
+    # A healthy run and a guard that tripped mid-run are not start failures.
+    assert "33333333" not in section
+    assert "44444444" not in section
+
+
 def test_report_contains_no_secrets(tmp_path):
     runs = tmp_path / "runs"
     # Poison fields the report actually renders (version appears in the
