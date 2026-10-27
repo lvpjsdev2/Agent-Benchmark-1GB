@@ -9,7 +9,10 @@ def read_pss_kb(proc_root: str | Path, pid: int) -> float | None:
     path = Path(proc_root) / str(pid) / "smaps_rollup"
     if not path.exists():
         return None
-    text = path.read_text()
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
     match = re.search(r"^Pss:\s+(\d+)\s+kB", text, re.MULTILINE)
     if match:
         return float(match.group(1))
@@ -21,7 +24,10 @@ def read_rss_kb(proc_root: str | Path, pid: int) -> float | None:
     path = Path(proc_root) / str(pid) / "status"
     if not path.exists():
         return None
-    text = path.read_text()
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
     match = re.search(r"^VmRSS:\s+(\d+)\s+kB", text, re.MULTILINE)
     if match:
         return float(match.group(1))
@@ -33,7 +39,10 @@ def read_mem_available_kb(proc_root: str | Path) -> float | None:
     path = Path(proc_root) / "meminfo"
     if not path.exists():
         return None
-    text = path.read_text()
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
     match = re.search(r"^MemAvailable:\s+(\d+)\s+kB", text, re.MULTILINE)
     if match:
         return float(match.group(1))

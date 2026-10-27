@@ -35,3 +35,20 @@ def test_missing_proc_files_return_none(tmp_path):
     assert read_pss_kb(tmp_path, 999999) is None
     assert read_rss_kb(tmp_path, 999999) is None
     assert read_mem_available_kb(tmp_path) is None
+
+
+def test_proc_permission_errors_return_none(monkeypatch, tmp_path):
+    """Container PIDs may be visible while smaps/status are ptrace-protected."""
+    original = Path.read_text
+
+    def denied(self, *args, **kwargs):
+        if str(self).endswith(("smaps_rollup", "status")):
+            raise PermissionError("ptrace scope")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    (tmp_path / "1000").mkdir()
+    (tmp_path / "1000" / "smaps_rollup").touch()
+    (tmp_path / "1000" / "status").touch()
+    assert read_pss_kb(tmp_path, 1000) is None
+    assert read_rss_kb(tmp_path, 1000) is None
