@@ -34,7 +34,17 @@ def _base_record(**over):
         "version": "1.0.0",
         "mode": "native",
         "scenario": "scenario_a_cold_start",
-        "host_profile": {"mem_available_mb_baseline": 480.0, "os": "darwin"},
+        # Experiment passport (ticket #37): the harness records what it can
+        # observe about the host — OS, kernel, CPU, RAM, swap, baseline.
+        "host_profile": {
+            "os": "darwin",
+            "kernel": "23.5.0",
+            "cpu_count": 4,
+            "ram_total_mb": 954.0,
+            "swap_total_mb": 4096.0,
+            "swap_free_mb": 3000.0,
+            "mem_available_mb_baseline": 480.0,
+        },
         "started_at_utc": "2026-01-01T00:00:00.000000Z",
         "duration_sec": 3.0,
         "ram_pss_mb_median": 12.5,
@@ -164,6 +174,50 @@ def test_start_failures_render_in_limitations_section(tmp_path):
     # A healthy run and a guard that tripped mid-run are not start failures.
     assert "33333333" not in section
     assert "44444444" not in section
+
+
+def test_passport_deviations_derived_from_records(tmp_path):
+    """Ticket #37: the passport never claims «нет» when records show deviations."""
+    runs = tmp_path / "runs"
+    _write_record(runs, "run-ok", _base_record(run_id="aaaa1111"))
+    out = tmp_path / "report.md"
+    code, _, stderr = _run_report(runs, out)
+    assert code == 0, stderr
+    passport = out.read_text().split("## Паспорт")[1].split("## Результаты")[0]
+    assert "- Отклонения от методики: нет" in passport
+    assert "- RAM / swap / MemAvailable до тестов (MB): 954 / 4096 (free 3000) / 480" in passport
+    assert "- ОС хоста, ядро, CPU: darwin, 23.5.0, 4" in passport
+
+    # A guard abort and orphaned (unfinished) processes are deviations.
+    _write_record(runs, "run-aborted", _base_record(
+        run_id="bbbb2222",
+        notes="repeats=1, aborted=guard2:oom_count=2>=guard_oom_threshold=1",
+    ))
+    _write_record(runs, "run-unfinished", _base_record(
+        run_id="cccc3333",
+        notes="repeats=1, unfinished_processes=2, unfinished_pids=11,22",
+    ))
+    out2 = tmp_path / "report2.md"
+    code, _, stderr = _run_report(runs, out2)
+    assert code == 0, stderr
+    passport = out2.read_text().split("## Паспорт")[1].split("## Результаты")[0]
+    assert "Отклонения от методики: есть: 2 из 3 прогонов с отклонениями" in passport
+
+
+def test_passport_version_line_appends_docker_digest(tmp_path):
+    """Ticket #37 review: the digest survives notes parsing without the comma."""
+    runs = tmp_path / "runs"
+    _write_record(runs, "run-d", _base_record(
+        run_id="dddd4444", mode="docker",
+        notes="repeats=1, runtime=docker, "
+              "docker_image=ghcr.io/example/agent@sha256:abc, disk_one_time_mb=null",
+    ))
+    out = tmp_path / "report.md"
+    code, _, stderr = _run_report(runs, out)
+    assert code == 0, stderr
+    passport = out.read_text().split("## Паспорт")[1].split("## Результаты")[0]
+    assert "alpha-agent docker 1.0.0 (ghcr.io/example/agent@sha256:abc)" in passport
+    assert "sha256:abc," not in passport
 
 
 def test_report_contains_no_secrets(tmp_path):

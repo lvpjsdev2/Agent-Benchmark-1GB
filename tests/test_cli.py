@@ -103,7 +103,15 @@ def test_run_produces_record_with_all_section7_fields(tmp_path):
     # cpu_sec from cgroup cpu.stat usage_usec 5000000 = 5 sec
     assert record["cpu_sec"] == 5.0
     assert record["ram_pss_mb_median"] == 15.0
-    assert record["host_profile"]["mem_available_mb_baseline"] == 512.0
+    # Experiment passport (ticket #37): RAM/swap come from the fixture meminfo,
+    # kernel/CPU from the host the harness runs on.
+    profile = record["host_profile"]
+    assert profile["mem_available_mb_baseline"] == 512.0
+    assert profile["ram_total_mb"] == 1024.0
+    assert profile["swap_total_mb"] == 1024.0
+    assert profile["swap_free_mb"] == 512.0
+    assert isinstance(profile["cpu_count"], int) and profile["cpu_count"] >= 1
+    assert isinstance(profile["kernel"], str) and profile["kernel"]
     assert record["startup_ms"] is not None and record["startup_ms"] > 0
     assert "variance" in record["notes"]
     # Notes should contain cgroup_path
