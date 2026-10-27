@@ -1327,6 +1327,8 @@ def cmd_run(args: Any) -> int:
             latency_ms=latency_ms,
             error_mode=error_mode,
             error_on_call=scenario_def.get("error_on_call"),
+            # Ticket #38: how long a "timeout" injection hangs the targeted call.
+            timeout_sleep_sec=float(scenario_def.get("mock_timeout_sleep_sec", 10.0)),
         )
         mock_server = MockLLMServer(port=mock_port_arg, config=cfg)
         mock_port_num = mock_server.start()

@@ -177,6 +177,24 @@ def test_scenario_d_error_on_single_call(tmp_path):
     assert record["error_count"] == 1
 
 
+def test_scenario_d_mock_timeout_on_single_call(tmp_path):
+    """Ticket #38: a timeout hangs the targeted call; its neighbours answer normally."""
+    runs = tmp_path / "runs"
+    scenario = _write_scenario(
+        tmp_path,
+        mock_error_mode="timeout",
+        error_on_call=3,
+        request_timeout_sec=0.2,
+        mock_timeout_sleep_sec=0.5,
+    )
+    code, out, err = _run_bench(tmp_path, runs, scenario)
+    assert code == 0, f"exit {code}: {err}"
+    record = _record(runs)
+    assert record["success_count"] == 9
+    assert record["error_count"] == 1
+    assert "mock_error_mode=timeout" in record["notes"]
+
+
 def test_scenario_d_hung_child_detected_as_unfinished(tmp_path):
     runs = tmp_path / "runs"
     scenario = _write_scenario(tmp_path)

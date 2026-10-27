@@ -1,11 +1,16 @@
-"""OpenAI-compatible mock LLM HTTP server with scripted responses."""
+"""OpenAI-compatible mock LLM HTTP server with scripted responses.
+
+Error injection (ticket #38): `error_on_call` limits the injected error to one
+call number; without it every call is affected. A `timeout` error hangs the
+targeted call for `timeout_sleep_sec` and leaves its neighbours untouched.
+"""
 
 from __future__ import annotations
 
 import json
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict
 
 DEFAULT_LATENCY_MS = 50
@@ -32,11 +37,15 @@ class MockConfig:
         response: Dict[str, Any] | None = None,
         error_mode: str | None = None,  # None, "429", "500", "timeout"
         error_on_call: int | None = None,
+        timeout_sleep_sec: float = 10.0,
     ):
         self.latency_ms = latency_ms
         self.response = response or DEFAULT_RESPONSE
         self.error_mode = error_mode
         self.error_on_call = error_on_call
+        # How long a "timeout" call hangs; must exceed the client's request
+        # timeout, so a scenario can shorten both for fast tests.
+        self.timeout_sleep_sec = timeout_sleep_sec
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -67,19 +76,21 @@ class _Handler(BaseHTTPRequestHandler):
         # Simulate latency
         time.sleep(cfg.latency_ms / 1000.0)
 
-        # Error injection
-        if cfg.error_mode:
-            if cfg.error_on_call is None or call_no == cfg.error_on_call:
-                status = 429 if cfg.error_mode == "429" else 500
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": {"message": cfg.error_mode}}).encode())
-                return
+        # Error injection. With `error_on_call` only that call is affected;
+        # without it every call is (ticket #38). A timeout hangs the targeted
+        # call — before the fix the target received HTTP 500 and every other
+        # call hung, i.e. the injection was inverted.
+        targeted = cfg.error_on_call is None or call_no == cfg.error_on_call
+        if cfg.error_mode and targeted:
             if cfg.error_mode == "timeout":
-                # Sleep beyond client timeout to simulate timeout
-                time.sleep(10)
+                time.sleep(cfg.timeout_sleep_sec)
                 return
+            status = 429 if cfg.error_mode == "429" else 500
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": {"message": cfg.error_mode}}).encode())
+            return
 
         # Normal response
         resp_body = json.dumps(cfg.response).encode()
@@ -91,6 +102,12 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class MockLLMServer:
+    """OpenAI-compatible mock on a threaded server.
+
+    Threaded since ticket #38: a hung `timeout` call must not block the requests
+    that follow it (the single-threaded server serialized the whole campaign).
+    """
+
     def __init__(self, host: str = "127.0.0.1", port: int = 0, config: MockConfig | None = None):
         self.host = host
         self.port = port
@@ -105,7 +122,7 @@ class MockLLMServer:
             (_Handler,),
             {"config": self.config, "counter": 0, "lock": threading.Lock()},
         )
-        self.httpd = HTTPServer((self.host, self.port), handler_cls)
+        self.httpd = ThreadingHTTPServer((self.host, self.port), handler_cls)
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
