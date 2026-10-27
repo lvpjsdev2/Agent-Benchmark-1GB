@@ -203,7 +203,7 @@ Output: two tables (native / docker), per-candidate rows, latency percentiles, r
 | Guard trip mid-scenario (codes 2–5) | Partial record written as-is (`aborted=guardN`), **no retry**, campaign moves on. |
 | A scenario failed but the candidate is alive | Remaining scenarios still run; each failure is noted separately. |
 | SSH/VM unavailable, disk full | Campaign stops, state recorded; resume only on an explicit human "go". |
-| Candidate failed completely | Recorded in «Ограничения результата»; never substituted — the second wave (Hermes Agent) stays out of this effort. |
+| Candidate failed completely | `bench report` lists it under «Ограничения результата» → «Какие проекты не запустились и почему» with its recorded reason (`install_failed=…` or `healthcheck failed after N start attempt(s)`); never substituted — the second wave (Hermes Agent) stays out of this effort. |
 
 ---
 
