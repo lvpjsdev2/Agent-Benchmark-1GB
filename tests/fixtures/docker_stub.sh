@@ -29,4 +29,12 @@ if [ "$1" = "run" ]; then
   exec "$@"
 fi
 
+if [ "$1" = "inspect" ]; then
+  # `inspect --format {{.State.Pid}} <name>`: report the fixture PID so the
+  # harness samples a real /proc fixture instead of this stub process.
+  echo "inspect $*" >> "$LOG"
+  echo "${DOCKER_STUB_PID:-1000}"
+  exit 0
+fi
+
 exit 1

@@ -54,9 +54,10 @@ def _write_descriptor(workdir: Path, image: str | None = None, docker_args: list
     return desc
 
 
-def _run_bench(workdir: Path, runs_dir: Path, desc: Path, scenario: Path | None = None) -> tuple[int, str, str, Path]:
+def _run_bench(workdir: Path, runs_dir: Path, desc: Path, scenario: Path | None = None,
+               extra_env: dict | None = None) -> tuple[int, str, str, Path]:
     stub_log = workdir / "docker_stub.log"
-    env = dict(os.environ, DOCKER_STUB_LOG=str(stub_log))
+    env = dict(os.environ, DOCKER_STUB_LOG=str(stub_log), **(extra_env or {}))
     cmd = [
         sys.executable, "-m", "bench", "run",
         str(desc), str(scenario or SCENARIO),
@@ -169,3 +170,29 @@ def test_docker_metrics_from_container_cgroup_fixture(tmp_path):
     # memory.peak 20971520 bytes = 20 MiB, cpu.stat usage_usec 5000000 = 5 sec
     assert record["ram_peak_mb"] == 20.0
     assert record["cpu_sec"] == 5.0
+
+
+def test_docker_container_pid_and_cgroup_resolved(tmp_path):
+    """Without fixture overrides the harness asks docker for the container PID
+    and reads the cgroup path from /proc/<pid>/cgroup (stub reports PID 1000)."""
+    runs = tmp_path / "runs"
+    scenario = tmp_path / "scenario_real.toml"
+    scenario.write_text(
+        'name = "scenario_a_cold_start"\n'
+        'duration_sec = 2\n'
+        'sample_interval_sec = 1\n'
+        'repeats = 1\n'
+    )
+    desc = _write_descriptor(tmp_path)
+    code, _, err, stub_log = _run_bench(
+        tmp_path, runs, desc, scenario, extra_env={"DOCKER_STUB_PID": "1000"},
+    )
+    assert code == 0, err
+    assert any(l.startswith("inspect ") for l in stub_log.read_text().splitlines())
+    record = json.loads(list(runs.glob("*/record.jsonl"))[0].read_text())
+    # Sampled from tests/fixtures/proc/1000: Pss 15360 kB = 15 MiB
+    assert record["ram_pss_mb_median"] == 15.0
+    # Cgroup read from /proc/1000/cgroup -> v2/agent: memory.peak = 20 MiB
+    assert record["ram_peak_mb"] == 20.0
+    assert record["cpu_sec"] == 5.0
+    assert "cgroup_path=v2/agent" in record["notes"]

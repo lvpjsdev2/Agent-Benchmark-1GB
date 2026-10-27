@@ -24,6 +24,7 @@ from bench.sampler import (
     read_memory_peak_bytes,
     read_cgroup_cpu_stat,
     read_cgroup_memory_events,
+    read_cgroup_path_from_proc,
     bytes_to_mb,
     cpu_sec_from_cgroup,
 )
@@ -105,6 +106,104 @@ def _cleanup_workdir(workdir: str | Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
+def _llm_target(
+    scenario_def: dict, mock_port: int | None, task_index: int | None = None
+) -> tuple[str | None, bytes, dict[str, str]]:
+    """Resolve the LLM endpoint, request body and headers for a scenario.
+
+    Endpoint priority: the harness's own mock server (``mock_port``) beats a
+    scenario ``llm_url``; legacy ``mock_llm_url`` is still honoured. The body
+    carries ``model`` and a user message when the scenario configures them —
+    real OpenAI-compatible endpoints reject the legacy empty-message payload.
+    ``llm_prompts`` cycles one prompt per task (scenario C has four tasks);
+    ``llm_prompt`` is the single-prompt fallback. The bearer token is read from
+    the environment variable named by ``llm_api_key_env`` so no secret is ever
+    written to a descriptor, scenario or record.
+    """
+    if mock_port is not None:
+        url = f"http://127.0.0.1:{mock_port}/v1/chat/completions"
+    else:
+        url = scenario_def.get("llm_url") or scenario_def.get("mock_llm_url") or None
+
+    model = scenario_def.get("llm_model")
+    if model:
+        prompts = scenario_def.get("llm_prompts") or []
+        if prompts and task_index is not None:
+            prompt = prompts[task_index % len(prompts)]
+        else:
+            prompt = scenario_def.get("llm_prompt", "Reply with OK.")
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": int(scenario_def.get("llm_max_tokens", 16)),
+        }
+        payload = json.dumps(body).encode()
+    else:
+        payload = b'{"messages":[]}'
+
+    headers = {"Content-Type": "application/json"}
+    key_env = scenario_def.get("llm_api_key_env")
+    if key_env:
+        key = os.environ.get(key_env)
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+    return url, payload, headers
+
+
+def _docker_container_pid(docker_bin: str, name: str) -> int | None:
+    """PID of a running container, asked from the docker daemon.
+
+    In docker mode the harness's child is the docker CLI, not the agent, so
+    sampling it would measure the client. The container name is deterministic
+    (``bench-<run_id>``) and is set by the harness when composing ``docker run``.
+    """
+    try:
+        out = subprocess.run(
+            [docker_bin, "inspect", "--format", "{{.State.Pid}}", name],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        pid = int(out.stdout.strip())
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def _cgroup_path_for(proc_root: str, pid: int, explicit: str | None) -> str:
+    """Cgroup path for the sampled PID.
+
+    An explicit path (scenario/descriptor, used by fixtures) wins. On a real
+    host the path is read from ``/proc/<pid>/cgroup``: there is no fixed
+    ``agent`` cgroup, so a hardcoded literal silently yields null peak/CPU/OOM.
+    """
+    if explicit:
+        return explicit
+    return read_cgroup_path_from_proc(proc_root, pid) or "agent"
+
+
+def _sample_target(
+    proc: subprocess.Popen,
+    agent_desc: dict,
+    proc_root: str,
+    proc_pid_override: Any,
+    explicit_cgroup_path: str | None = None,
+) -> tuple[int, str]:
+    """PID to sample and its cgroup path (fixture override wins, then docker)."""
+    if proc_pid_override:
+        pid = int(proc_pid_override)
+    elif agent_desc.get("container_name"):
+        pid = _docker_container_pid(
+            agent_desc.get("docker_bin", "docker"), agent_desc["container_name"]
+        ) or proc.pid
+    else:
+        pid = proc.pid
+    return pid, _cgroup_path_for(proc_root, pid, explicit_cgroup_path)
+
+
 def _percentile(data: list[float], p: float) -> float:
     """Linear-interpolated percentile of a sorted-able list, 0..100."""
     data_sorted = sorted(data)
@@ -184,8 +283,8 @@ def _run_single_repeat_scenario_a(
     repeat_idx: int,
 ) -> dict[str, Any]:
     """Execute one repeat of scenario A (cold start / idle). Returns metrics dict."""
-    # Cgroup path for agent; scenario may define it for fixtures
-    cgroup_path = scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path") or "agent"
+    # Cgroup path for agent; scenario/descriptor may define it for fixtures
+    explicit_cgroup = scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path")
     duration_s = scenario_def.get("duration_sec", 10)
     sample_interval = scenario_def.get("sample_interval_sec", 1)
     hc = agent_desc.get("healthcheck", {})
@@ -240,12 +339,14 @@ def _run_single_repeat_scenario_a(
         stderr=subprocess.DEVNULL,
     )
     pid = proc.pid
-    sample_pid = int(proc_pid_override) if proc_pid_override else pid
 
     # Wait for healthcheck; failure is the health guard (exit code 4)
     healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
     t_healthy = time.monotonic()
     startup_ms = (t_healthy - t_start) * 1000.0 if healthy else None
+    sample_pid, cgroup_path = _sample_target(
+        proc, agent_desc, proc_root, proc_pid_override, explicit_cgroup
+    )
     guard = None
     if not healthy:
         guard = _health_guard()
@@ -372,7 +473,6 @@ def _run_single_repeat_scenario_b(
         stderr=subprocess.DEVNULL,
     )
     pid = proc.pid
-    sample_pid = int(proc_pid_override) if proc_pid_override else pid
 
     healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
     if not healthy:
@@ -403,6 +503,10 @@ def _run_single_repeat_scenario_b(
 
     t_healthy = time.monotonic()
     startup_ms = (t_healthy - t_start) * 1000.0
+    sample_pid, _cgroup = _sample_target(
+        proc, agent_desc, proc_root, proc_pid_override,
+        scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path"),
+    )
 
     # Sampling during requests (scenario B measures during execution)
     pss_samples: list[float] = []
@@ -417,9 +521,7 @@ def _run_single_repeat_scenario_b(
     error_count = 0
     latencies_ms: list[float] = []
 
-    mock_llm_url = scenario_def.get("mock_llm_url")
-    if mock_port:
-        mock_llm_url = f"http://127.0.0.1:{mock_port}/v1/chat/completions"
+    mock_llm_url, llm_payload, llm_headers = _llm_target(scenario_def, mock_port)
     request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
 
     # Tool cycles flag
@@ -446,7 +548,7 @@ def _run_single_repeat_scenario_b(
 
         try:
             if mock_llm_url:
-                req = urllib.request.Request(mock_llm_url, method="POST", data=b'{"messages":[]}', headers={"Content-Type": "application/json"})
+                req = urllib.request.Request(mock_llm_url, method="POST", data=llm_payload, headers=llm_headers)
                 with urllib.request.urlopen(req, timeout=request_timeout) as resp:
                     _ = resp.read()
                     ok = resp.status == 200
@@ -616,6 +718,10 @@ def _run_single_repeat_scenario_c(
         }
 
     startup_ms = (time.monotonic() - t_start) * 1000.0
+    sample_pid, _cgroup = _sample_target(
+        proc, agent_desc, proc_root, proc_pid_override,
+        scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path"),
+    )
 
     pss_samples: list[float] = []
     rss_samples: list[float] = []
@@ -625,14 +731,14 @@ def _run_single_repeat_scenario_c(
     api_budget = scenario_def.get("guard_api_request_budget")
     guard = None
 
-    # With a mock server (port may be 0 = OS-assigned) tasks issue real requests
-    if mock_port is not None:
-        mock_llm_url = f"http://127.0.0.1:{mock_port}/v1/chat/completions"
+    mock_llm_url, _, _ = _llm_target(scenario_def, mock_port)
+    if mock_llm_url is not None:
         request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
         for task in range(total_tasks):
             if proc.poll() is not None:
                 guard = _health_guard()
                 break
+            _, llm_payload, llm_headers = _llm_target(scenario_def, mock_port, task)
             pss = read_pss_kb(proc_root, sample_pid)
             rss = read_rss_kb(proc_root, sample_pid)
             if pss is not None:
@@ -643,8 +749,8 @@ def _run_single_repeat_scenario_c(
             req_start = time.monotonic()
             try:
                 req = urllib.request.Request(
-                    mock_llm_url, method="POST", data=b'{"messages":[]}',
-                    headers={"Content-Type": "application/json"},
+                    mock_llm_url, method="POST", data=llm_payload,
+                    headers=llm_headers,
                 )
                 with urllib.request.urlopen(req, timeout=request_timeout) as resp:
                     _ = resp.read()
@@ -661,7 +767,7 @@ def _run_single_repeat_scenario_c(
                 break
             time.sleep(0.01)
 
-    unfinished = total_tasks - success_count if mock_port is not None else total_tasks
+    unfinished = total_tasks - success_count if mock_llm_url is not None else total_tasks
 
     if proc.poll() is None:
         proc.terminate()
@@ -814,6 +920,10 @@ def _run_single_repeat_scenario_d(
         }
 
     startup_ms = (time.monotonic() - t_start) * 1000.0
+    sample_pid, _cgroup = _sample_target(
+        proc, agent_desc, proc_root, proc_pid_override,
+        scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path"),
+    )
 
     rss_start_kb = read_rss_kb(proc_root, sample_pid)
     success_count = 0
@@ -825,9 +935,7 @@ def _run_single_repeat_scenario_d(
     # by the mid-series restart is just as unfinished as one left at the end.
     seen_children: set[int] = set()
 
-    mock_llm_url = None
-    if mock_port is not None:
-        mock_llm_url = f"http://127.0.0.1:{mock_port}/v1/chat/completions"
+    mock_llm_url, llm_payload, llm_headers = _llm_target(scenario_def, mock_port)
 
     for i in range(total_requests):
         if proc.poll() is not None:
@@ -838,8 +946,8 @@ def _run_single_repeat_scenario_d(
         try:
             if mock_llm_url:
                 req = urllib.request.Request(
-                    mock_llm_url, method="POST", data=b'{"messages":[]}',
-                    headers={"Content-Type": "application/json"},
+                    mock_llm_url, method="POST", data=llm_payload,
+                    headers=llm_headers,
                 )
                 with urllib.request.urlopen(req, timeout=request_timeout) as resp:
                     _ = resp.read()
@@ -1131,6 +1239,8 @@ def cmd_run(args: Any) -> int:
             run_flags = _docker_run_flags(scenario_def, run_id, agent_desc)
             agent_desc = {
                 **agent_desc,
+                "container_name": f"bench-{run_id}",
+                "docker_bin": docker_bin,
                 "start_command": [docker_bin, "run", *run_flags, docker_image, *agent_desc["start_command"]],
             }
 

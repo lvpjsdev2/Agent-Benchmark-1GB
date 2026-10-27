@@ -1,0 +1,12 @@
+# MicroClaw reads an explicit YAML config outside the (wiped) workdir.
+name = "MicroClaw"
+repo_url = "https://github.com/microclaw/microclaw"
+version = "0.11.1"
+mode = "native"
+start_command = ["microclaw", "--config", "/home/ubuntu/bench-config/microclaw/microclaw.config.yaml", "start"]
+workdir = "/tmp/bench-wd/microclaw"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:10961/health"
+timeout_sec = 60

@@ -1,0 +1,24 @@
+# Scenario C (METHODOLOGY §3 C): 4 fixed tasks x 5 repeats against a real
+# OpenAI-compatible endpoint. The API key is read from BENCH_LLM_API_KEY so it
+# never enters this file or any record. The harness measures request
+# success/latency and agent resource use; answer correctness is out of scope.
+name = "scenario_c_real_llm_tasks"
+task_count = 4
+repeats_per_task = 5
+repeats = 1
+llm_url = "https://freellmapi.lvpjsdev.com/v1/chat/completions"
+llm_model = "auto"
+llm_api_key_env = "BENCH_LLM_API_KEY"
+llm_max_tokens = 32
+request_timeout_sec = 120
+llm_prompts = [
+  "Answer with a single number, nothing else: 7*6?",
+  "Answer with a single number, nothing else: sum of 12, 30 and 45?",
+  "Answer with a single word, nothing else: the capital of France?",
+  "Answer with a single word, nothing else: the chemical symbol for gold?",
+]
+guard_api_request_budget = 200
+guard_oom_threshold = 1
+guard_memavailable_min_mb = 100
+docker_memory_limit = "512m"
+docker_cpu_limit = "1.0"

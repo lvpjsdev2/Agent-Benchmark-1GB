@@ -1,0 +1,18 @@
+# ZeptoClaw docker: the official image is built without the `panel` feature, so the
+# gateway (health server on 9090) is the entry point. Config is mounted read-only.
+name = "ZeptoClaw"
+repo_url = "https://github.com/qhkm/zeptoclaw"
+version = "0.9.2"
+mode = "docker"
+image = "ghcr.io/qhkm/zeptoclaw@sha256:e32bce5650aae597a2d2ebda3d4c3d5cf2349f9354934691d263ac7414a6b86a"
+start_command = ["zeptoclaw", "gateway"]
+docker_args = [
+  "-p", "127.0.0.1:9090:9090",
+  "-v", "/home/ubuntu/bench-config/zeptoclaw:/data/.zeptoclaw:ro",
+]
+workdir = "/tmp/bench-wd/zeptoclaw_docker"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:9090/healthz"
+timeout_sec = 60
