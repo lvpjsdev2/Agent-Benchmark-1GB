@@ -65,7 +65,9 @@ def _median_of(profiles: list[dict], key: str) -> float | None:
     return statistics.median(values) if values else None
 
 
-_DOCKER_IMAGE_RE = re.compile(r"docker_image=(\S+)")
+# Notes are joined with ", ", so the value stops at a comma as well as at
+# whitespace — otherwise a digest picks up the next field's separator.
+_DOCKER_IMAGE_RE = re.compile(r"docker_image=([^,\s]+)")
 
 
 def _version_line(record: dict) -> str:
@@ -96,7 +98,12 @@ def _deviation_summary(records: list[dict]) -> str:
             deviating += 1
     if not deviating:
         return "нет"
-    return f"есть: {deviating} из {len(records)} прогонов — см. «Ограничения результата»"
+    # No pointer to «Ограничения результата»: that section lists start failures
+    # only, while guard aborts and orphaned processes are explained by notes.
+    return (
+        f"есть: {deviating} из {len(records)} прогонов с отклонениями "
+        "(guard-обрыв, install_failed или незавершённые процессы)"
+    )
 
 
 # Start failures the runner records in notes (ticket #29). Notes are joined with

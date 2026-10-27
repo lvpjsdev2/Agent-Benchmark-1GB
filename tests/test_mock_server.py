@@ -43,7 +43,7 @@ def _post(url: str, timeout: float) -> tuple[int | None, Exception | None, float
 def test_429_without_target_errors_every_call():
     server, url = _start(error_mode="429", latency_ms=0)
     try:
-        assert [ _post(url, timeout=2.0)[0] for _ in range(3) ] == [429, 429, 429]
+        assert [_post(url, timeout=2.0)[0] for _ in range(3)] == [429, 429, 429]
     finally:
         server.stop()
 

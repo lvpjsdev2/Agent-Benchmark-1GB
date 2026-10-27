@@ -201,7 +201,23 @@ def test_passport_deviations_derived_from_records(tmp_path):
     code, _, stderr = _run_report(runs, out2)
     assert code == 0, stderr
     passport = out2.read_text().split("## Паспорт")[1].split("## Результаты")[0]
-    assert "Отклонения от методики: есть: 2 из 3 прогонов" in passport
+    assert "Отклонения от методики: есть: 2 из 3 прогонов с отклонениями" in passport
+
+
+def test_passport_version_line_appends_docker_digest(tmp_path):
+    """Ticket #37 review: the digest survives notes parsing without the comma."""
+    runs = tmp_path / "runs"
+    _write_record(runs, "run-d", _base_record(
+        run_id="dddd4444", mode="docker",
+        notes="repeats=1, runtime=docker, "
+              "docker_image=ghcr.io/example/agent@sha256:abc, disk_one_time_mb=null",
+    ))
+    out = tmp_path / "report.md"
+    code, _, stderr = _run_report(runs, out)
+    assert code == 0, stderr
+    passport = out.read_text().split("## Паспорт")[1].split("## Результаты")[0]
+    assert "alpha-agent docker 1.0.0 (ghcr.io/example/agent@sha256:abc)" in passport
+    assert "sha256:abc," not in passport
 
 
 def test_report_contains_no_secrets(tmp_path):

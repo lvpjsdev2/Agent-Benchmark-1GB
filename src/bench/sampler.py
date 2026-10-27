@@ -36,17 +36,8 @@ def read_rss_kb(proc_root: str | Path, pid: int) -> float | None:
 
 def read_mem_available_kb(proc_root: str | Path) -> float | None:
     """Read MemAvailable in kB from /proc/meminfo under proc_root."""
-    path = Path(proc_root) / "meminfo"
-    if not path.exists():
-        return None
-    try:
-        text = path.read_text()
-    except OSError:
-        return None
-    match = re.search(r"^MemAvailable:\s+(\d+)\s+kB", text, re.MULTILINE)
-    if match:
-        return float(match.group(1))
-    return None
+    meminfo = read_meminfo_kb(proc_root)
+    return meminfo.get("MemAvailable") if meminfo else None
 
 
 def read_meminfo_kb(proc_root: str | Path) -> dict[str, float] | None:
