@@ -9,7 +9,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bench.sampler import kb_to_mb, read_mem_available_kb, read_pss_kb, read_rss_kb
+from bench.sampler import (
+    kb_to_mb,
+    read_mem_available_kb,
+    read_meminfo_kb,
+    read_pss_kb,
+    read_rss_kb,
+)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 PROC_ROOT = FIXTURES / "proc"
@@ -31,10 +37,21 @@ def test_read_mem_available_from_fixture_meminfo():
     assert kb_to_mb(read_mem_available_kb(PROC_ROOT)) == 512.0
 
 
+def test_read_meminfo_reads_ram_and_swap_from_fixture():
+    """Ticket #37: the passport needs RAM and swap, not only MemAvailable."""
+    meminfo = read_meminfo_kb(PROC_ROOT)
+    assert meminfo is not None
+    assert meminfo["MemTotal"] == 1048576.0
+    assert meminfo["MemAvailable"] == 524288.0
+    assert meminfo["SwapTotal"] == 1048576.0
+    assert meminfo["SwapFree"] == 524288.0
+
+
 def test_missing_proc_files_return_none(tmp_path):
     assert read_pss_kb(tmp_path, 999999) is None
     assert read_rss_kb(tmp_path, 999999) is None
     assert read_mem_available_kb(tmp_path) is None
+    assert read_meminfo_kb(tmp_path) is None
 
 
 def test_proc_permission_errors_return_none(monkeypatch, tmp_path):

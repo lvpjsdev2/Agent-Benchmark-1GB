@@ -3,9 +3,9 @@
 ## Паспорт эксперимента
 
 - UTC-период: 2026-01-01T00:00:00.000000Z — 2026-01-02T00:00:00.000000Z
-- ОС хоста: darwin
-- RAM / MemAvailable до тестов (MB, baseline): 480
-- Версии агентов (имя / режим / версия): alpha-agent docker 1.0.0, alpha-agent native 1.0.0, beta-agent native 1.0.0
+- ОС хоста, ядро, CPU: darwin, 23.5.0, 4
+- RAM / swap / MemAvailable до тестов (MB): 954 / 4096 (free 3000) / 480
+- Версии агентов (имя / режим / версия / digest): alpha-agent docker 1.0.0, alpha-agent native 1.0.0, beta-agent native 1.0.0
 - Реальный провайдер и модель (без ключей): —
 - Отклонения от методики: нет
 

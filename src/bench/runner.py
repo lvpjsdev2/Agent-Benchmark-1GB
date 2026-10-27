@@ -20,6 +20,7 @@ from bench.sampler import (
     read_pss_kb,
     read_rss_kb,
     read_mem_available_kb,
+    read_meminfo_kb,
     kb_to_mb,
     read_memory_peak_bytes,
     read_cgroup_cpu_stat,
@@ -363,6 +364,11 @@ def _budget_guard(budget: int, issued: int) -> dict:
         "code": GUARD_EXIT_CODES["api_budget"],
         "reason": f"api_requests={issued}>=guard_api_request_budget={budget}",
     }
+
+
+def _meminfo_mb(meminfo: dict[str, float], key: str) -> float | None:
+    """A kB value from /proc/meminfo as MB, or None when the field is absent."""
+    return kb_to_mb(meminfo[key]) if key in meminfo else None
 
 
 def _prepare_candidate(agent_desc: dict, scenario_def: dict, proc_root: str) -> dict[str, Any]:
@@ -1419,9 +1425,19 @@ def cmd_run(args: Any) -> int:
         record["version"] = agent_desc.get("version", None)
         record["mode"] = agent_desc.get("mode", None)
         record["scenario"] = scenario_name
+        # Experiment passport (ticket #37): record what the harness can observe
+        # about the host, so `bench report` fills the template lines from data
+        # instead of printing dashes and hardcoded claims. Everything unreadable
+        # stays None and renders as a dash.
+        meminfo = read_meminfo_kb(proc_root) or {}
         record["host_profile"] = {
-            "mem_available_mb_baseline": baseline_mb,
             "os": sys.platform,
+            "kernel": os.uname().release if hasattr(os, "uname") else None,
+            "cpu_count": os.cpu_count(),
+            "ram_total_mb": _meminfo_mb(meminfo, "MemTotal"),
+            "swap_total_mb": _meminfo_mb(meminfo, "SwapTotal"),
+            "swap_free_mb": _meminfo_mb(meminfo, "SwapFree"),
+            "mem_available_mb_baseline": baseline_mb,
         }
         record["started_at_utc"] = primary["started_at_utc"]
         record["duration_sec"] = primary["duration_sec"]

@@ -49,6 +49,31 @@ def read_mem_available_kb(proc_root: str | Path) -> float | None:
     return None
 
 
+def read_meminfo_kb(proc_root: str | Path) -> dict[str, float] | None:
+    """Read every `Key: <n> kB` field of /proc/meminfo under proc_root (ticket #37).
+
+    The experiment passport needs more than MemAvailable: total RAM and swap are
+    part of it. Returns None when meminfo is absent; fields without a kB unit are
+    skipped, so a partial fixture is fine.
+    """
+    path = Path(proc_root) / "meminfo"
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    data: dict[str, float] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] == "kB":
+            try:
+                data[parts[0].rstrip(":")] = float(parts[1])
+            except ValueError:
+                continue
+    return data or None
+
+
 def kb_to_mb(kb: float) -> float:
     return kb / 1024.0
 

@@ -50,6 +50,55 @@ def _fmt(value, unsupported: bool = False) -> str:
     return str(value)
 
 
+def _join(values: list[str]) -> str:
+    """Comma-joined unique values, or a dash when nothing was recorded."""
+    return ", ".join(values) if values else "—"
+
+
+def _median_of(profiles: list[dict], key: str) -> float | None:
+    """Median of one host-profile field across records (ticket #37).
+
+    The passport renders a single value per line, and it must not depend on how
+    many runs contributed: a median keeps the line deterministic.
+    """
+    values = [p.get(key) for p in profiles if p.get(key) is not None]
+    return statistics.median(values) if values else None
+
+
+_DOCKER_IMAGE_RE = re.compile(r"docker_image=(\S+)")
+
+
+def _version_line(record: dict) -> str:
+    """Agent / mode / version, plus the pinned digest when one was recorded."""
+    line = f"{record.get('agent')} {record.get('mode')} {record.get('version')}"
+    notes = " ".join(str(record.get("notes") or "").split())
+    image = _DOCKER_IMAGE_RE.search(notes)
+    if image:
+        line += f" ({image.group(1)})"
+    return line
+
+
+def _deviation_summary(records: list[dict]) -> str:
+    """Passport line derived from records, never hardcoded (ticket #37).
+
+    A run deviates from the full plan when a guard aborted it, when the candidate
+    never started, or when it left unfinished (orphaned) processes behind.
+    """
+    deviating = 0
+    for r in records:
+        notes = " ".join(str(r.get("notes") or "").split())
+        unfinished = re.search(r"unfinished_processes=(\d+)", notes)
+        if (
+            "aborted=" in notes
+            or "install_failed=" in notes
+            or (unfinished is not None and int(unfinished.group(1)) > 0)
+        ):
+            deviating += 1
+    if not deviating:
+        return "нет"
+    return f"есть: {deviating} из {len(records)} прогонов — см. «Ограничения результата»"
+
+
 # Start failures the runner records in notes (ticket #29). Notes are joined with
 # ", " and a reason may itself contain commas, so a value runs until the next
 # "<key>=" field. Only "the candidate never came up" counts here: a guard that
@@ -102,21 +151,35 @@ def generate_report(records: list[dict]) -> str:
     # --- Паспорт эксперимента -------------------------------------------
     stamps = [r.get("started_at_utc") for r in records if r.get("started_at_utc")]
     period = f"{min(stamps)} — {max(stamps)}" if stamps else "—"
-    os_names = sorted({str(r.get("host_profile", {}).get("os")) for r in records if r.get("host_profile")})
     # An unavailable record (ticket #29) has no host_profile: a missing profile
     # renders as a dash, it never aborts report generation.
-    baselines = [(r.get("host_profile") or {}).get("mem_available_mb_baseline") for r in records]
+    profiles = [r.get("host_profile") or {} for r in records if r.get("host_profile")]
+    os_names = _join(sorted({str(p["os"]) for p in profiles if p.get("os")}))
+    kernels = _join(sorted({str(p["kernel"]) for p in profiles if p.get("kernel")}))
+    cpus = _join([
+        str(c) for c in sorted({p.get("cpu_count") for p in profiles if p.get("cpu_count") is not None})
+    ])
+    ram_total_mb = _median_of(profiles, "ram_total_mb")
+    swap_total_mb = _median_of(profiles, "swap_total_mb")
+    swap_free_mb = _median_of(profiles, "swap_free_mb")
+    baselines = [p.get("mem_available_mb_baseline") for p in profiles]
     baselines = [b for b in baselines if b is not None]
-    versions = sorted({f"{r.get('agent')} {r.get('mode')} {r.get('version')}" for r in records}) or ["—"]
+    versions = sorted({_version_line(r) for r in records}) or ["—"]
+    swap_text = _fmt(swap_total_mb)
+    if swap_free_mb is not None:
+        swap_text += f" (free {_fmt(swap_free_mb)})"
 
     lines.append("## Паспорт эксперимента")
     lines.append("")
     lines.append(f"- UTC-период: {period}")
-    lines.append(f"- ОС хоста: {', '.join(os_names) if os_names else '—'}")
-    lines.append(f"- RAM / MemAvailable до тестов (MB, baseline): {_fmt(statistics.median(baselines) if baselines else None)}")
-    lines.append(f"- Версии агентов (имя / режим / версия): {', '.join(versions)}")
+    lines.append(f"- ОС хоста, ядро, CPU: {os_names}, {kernels}, {cpus}")
+    lines.append(
+        "- RAM / swap / MemAvailable до тестов (MB): "
+        f"{_fmt(ram_total_mb)} / {swap_text} / {_fmt(statistics.median(baselines) if baselines else None)}"
+    )
+    lines.append(f"- Версии агентов (имя / режим / версия / digest): {', '.join(versions)}")
     lines.append("- Реальный провайдер и модель (без ключей): —")
-    lines.append("- Отклонения от методики: нет")
+    lines.append(f"- Отклонения от методики: {_deviation_summary(records)}")
     lines.append("")
 
     # --- Результаты ресурсов ---------------------------------------------
