@@ -19,6 +19,8 @@ FIXTURES = ROOT / "tests" / "fixtures"
 PROC_ROOT = FIXTURES / "proc"
 AGENT_SCRIPT = FIXTURES / "sleeper_agent.py"
 
+from chat_agent_utils import free_port, write_chat_descriptor
+
 
 def _write_descriptor(workdir: Path, timeout_sec: int = 10, health_value: str | None = None) -> Path:
     workdir.mkdir(parents=True, exist_ok=True)
@@ -55,8 +57,12 @@ def _write_scenario(workdir: Path, **over) -> Path:
     return path
 
 
-def _run_bench(workdir: Path, runs_dir: Path, scenario: Path, *extra: str, timeout_sec: int = 10, cgroup_root: str | None = None, health_value: str | None = None) -> tuple[int, str, str]:
-    desc = _write_descriptor(workdir, timeout_sec=timeout_sec, health_value=health_value)
+def _run_bench(workdir: Path, runs_dir: Path, scenario: Path, *extra: str, timeout_sec: int = 10, cgroup_root: str | None = None, health_value: str | None = None, chat: bool = False) -> tuple[int, str, str]:
+    if chat:
+        # Ticket #40: request scenarios need the candidate's own chat endpoint.
+        desc = write_chat_descriptor(workdir, free_port())
+    else:
+        desc = _write_descriptor(workdir, timeout_sec=timeout_sec, health_value=health_value)
     cmd = [
         sys.executable, "-m", "bench", "run",
         str(desc), str(scenario),
@@ -181,7 +187,7 @@ def _write_scenario_b(workdir: Path, **over) -> Path:
 def test_api_budget_guard_stops_run_with_exit_code_5(tmp_path):
     runs = tmp_path / "runs"
     scenario = _write_scenario_b(tmp_path, guard_api_request_budget=3)
-    code, out, err = _run_bench(tmp_path, runs, scenario, "--mock-llm-port", "0")
+    code, out, err = _run_bench(tmp_path, runs, scenario, "--mock-llm-port", "0", chat=True)
     assert code == 5, f"exit {code}: {err}"
     summary = json.loads(out)
     assert summary["guard"]["code"] == 5
@@ -194,5 +200,5 @@ def test_api_budget_guard_stops_run_with_exit_code_5(tmp_path):
 def test_api_budget_not_reached_does_not_abort(tmp_path):
     runs = tmp_path / "runs"
     scenario = _write_scenario_b(tmp_path, guard_api_request_budget=100)
-    code, out, err = _run_bench(tmp_path, runs, scenario, "--mock-llm-port", "0")
+    code, out, err = _run_bench(tmp_path, runs, scenario, "--mock-llm-port", "0", chat=True)
     assert code == 0, f"exit {code}: {err}"

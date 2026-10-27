@@ -1,9 +1,9 @@
-"""Tests for the LLM request target (payload, auth, endpoint resolution).
+"""Tests for the request the harness sends to the candidate (ticket #40).
 
-The real endpoint (FreeLLMAPI) rejects the legacy fixture payload
-``{"messages": []}`` and requires a bearer token, so the harness must send a
-model and a message. These tests use a strict OpenAI-like server that enforces
-exactly that contract.
+The harness posts to the descriptor's ``chat_url``, not to the candidate's LLM
+endpoint. These tests run a strict OpenAI-like server as the *candidate* and
+assert the payload and bearer token it receives: a model, a non-empty message,
+and the token named by ``chat_api_key_env`` (never written to disk).
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ TOKEN = "test-token-123"
 
 
 class _StrictHandler(BaseHTTPRequestHandler):
-    """400 on empty messages, 401 without bearer token, 200 when both are fine."""
+    """400 on empty messages or missing model, 401 without bearer token."""
 
     seen: list[dict] = []
 
@@ -71,7 +71,7 @@ def _serve_strict():
     return httpd, httpd.server_address[1], handler_cls
 
 
-def _descriptor(tmp_path: Path) -> Path:
+def _descriptor(tmp_path: Path, chat_port: int) -> Path:
     workdir = tmp_path / "wd"
     workdir.mkdir(parents=True, exist_ok=True)
     desc = tmp_path / "agent.toml"
@@ -80,6 +80,8 @@ def _descriptor(tmp_path: Path) -> Path:
         repo_url = "https://example.com/sleeper"
         version = "0.0.1"
         mode = "native"
+        chat_url = "http://127.0.0.1:{chat_port}/v1/chat/completions"
+        chat_api_key_env = "BENCH_CHAT_KEY"
         start_command = ["python3", "{AGENT_SCRIPT}", "{workdir}", "0.1"]
         workdir = "{workdir}"
 
@@ -128,17 +130,15 @@ SCENARIO_C = """
 """
 
 
-def test_scenario_b_sends_model_and_message_when_llm_url_configured(tmp_path):
+def test_chat_request_carries_model_message_and_bearer_token(tmp_path):
     httpd, port, handler = _serve_strict()
     try:
-        scenario = _scenario(tmp_path, IMPLICIT + f"""
-    llm_url = "http://127.0.0.1:{port}/v1/chat/completions"
+        scenario = _scenario(tmp_path, IMPLICIT + """
     llm_model = "test-model"
     llm_prompt = "say ok"
-    llm_api_key_env = "BENCH_TEST_KEY"
 """)
         runs = tmp_path / "runs"
-        proc = _run(_descriptor(tmp_path), scenario, runs, env={"BENCH_TEST_KEY": TOKEN})
+        proc = _run(_descriptor(tmp_path, port), scenario, runs, env={"BENCH_CHAT_KEY": TOKEN})
         assert proc.returncode == 0, proc.stderr
         record = json.loads(list(runs.glob("*/record.jsonl"))[0].read_text())
         assert record["success_count"] == 5
@@ -151,56 +151,31 @@ def test_scenario_b_sends_model_and_message_when_llm_url_configured(tmp_path):
         httpd.server_close()
 
 
-def test_scenario_b_without_model_fails_against_strict_endpoint(tmp_path):
+def test_chat_request_always_sends_a_model(tmp_path):
+    """The legacy empty payload is gone: the candidate always gets a model."""
     httpd, port, handler = _serve_strict()
     try:
-        scenario = _scenario(tmp_path, IMPLICIT + f"""
-    llm_url = "http://127.0.0.1:{port}/v1/chat/completions"
-    llm_api_key_env = "BENCH_TEST_KEY"
-""")
+        scenario = _scenario(tmp_path, IMPLICIT)
         runs = tmp_path / "runs"
-        proc = _run(_descriptor(tmp_path), scenario, runs, env={"BENCH_TEST_KEY": TOKEN})
+        proc = _run(_descriptor(tmp_path, port), scenario, runs, env={"BENCH_CHAT_KEY": TOKEN})
         assert proc.returncode == 0, proc.stderr
         record = json.loads(list(runs.glob("*/record.jsonl"))[0].read_text())
-        # Legacy empty-message payload is rejected by a strict endpoint.
-        assert record["success_count"] == 0
-        assert record["error_count"] == 5
+        assert record["success_count"] == 5
+        assert handler.seen[0]["body"]["model"] == "bench-model"
+        assert handler.seen[0]["body"]["messages"][0]["content"] == "Reply with OK."
     finally:
         httpd.shutdown()
         httpd.server_close()
 
 
-def test_scenario_c_uses_llm_url_without_mock_port(tmp_path):
+def test_scenario_c_cycles_llm_prompts_through_the_candidate(tmp_path):
     httpd, port, handler = _serve_strict()
     try:
-        scenario = _scenario(tmp_path, SCENARIO_C + f"""
-    llm_url = "http://127.0.0.1:{port}/v1/chat/completions"
-    llm_model = "test-model"
-    llm_api_key_env = "BENCH_TEST_KEY"
-""")
-        runs = tmp_path / "runs"
-        proc = _run(_descriptor(tmp_path), scenario, runs, env={"BENCH_TEST_KEY": TOKEN})
-        assert proc.returncode == 0, proc.stderr
-        record = json.loads(list(runs.glob("*/record.jsonl"))[0].read_text())
-        assert record["success_count"] == 2
-        assert "unfinished_processes=0" in record["notes"]
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-def test_scenario_c_cycles_llm_prompts(tmp_path):
-    """Scenario C runs four distinct tasks: llm_prompts[i % len] per task."""
-    httpd, port, handler = _serve_strict()
-    try:
-        scenario = _scenario(tmp_path, SCENARIO_C + f"""
-    llm_url = "http://127.0.0.1:{port}/v1/chat/completions"
-    llm_model = "test-model"
-    llm_api_key_env = "BENCH_TEST_KEY"
+        scenario = _scenario(tmp_path, SCENARIO_C + """
     llm_prompts = ["task one", "task two"]
 """)
         runs = tmp_path / "runs"
-        proc = _run(_descriptor(tmp_path), scenario, runs, env={"BENCH_TEST_KEY": TOKEN})
+        proc = _run(_descriptor(tmp_path, port), scenario, runs, env={"BENCH_CHAT_KEY": TOKEN})
         assert proc.returncode == 0, proc.stderr
         prompts = [s["body"]["messages"][0]["content"] for s in handler.seen]
         assert prompts == ["task one", "task two"]

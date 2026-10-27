@@ -107,48 +107,120 @@ def _cleanup_workdir(workdir: str | Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def _llm_target(
-    scenario_def: dict, mock_port: int | None, task_index: int | None = None
-) -> tuple[str | None, bytes, dict[str, str]]:
-    """Resolve the LLM endpoint, request body and headers for a scenario.
+def _resolve_env(
+    agent_desc: dict, scenario_def: dict, mock_port: int | None
+) -> dict[str, str]:
+    """Environment for the candidate process, with harness placeholders resolved.
 
-    Endpoint priority: the harness's own mock server (``mock_port``) beats a
-    scenario ``llm_url``; legacy ``mock_llm_url`` is still honoured. The body
-    carries ``model`` and a user message when the scenario configures them —
-    real OpenAI-compatible endpoints reject the legacy empty-message payload.
-    ``llm_prompts`` cycles one prompt per task (scenario C has four tasks);
-    ``llm_prompt`` is the single-prompt fallback. The bearer token is read from
-    the environment variable named by ``llm_api_key_env`` so no secret is ever
-    written to a descriptor, scenario or record.
+    Ticket #40: the harness sends its requests to the candidate, so the candidate
+    is what must talk to the mock (or the real provider). A descriptor declares
+    the env vars its agent honours and the harness fills the addresses in, e.g.
+    ``env = { OPENAI_BASE_URL = "{mock_base_url}" }``. That keeps the dynamically
+    chosen mock port out of static agent configs.
     """
-    if mock_port is not None:
-        url = f"http://127.0.0.1:{mock_port}/v1/chat/completions"
-    else:
-        url = scenario_def.get("llm_url") or scenario_def.get("mock_llm_url") or None
-
-    model = scenario_def.get("llm_model")
-    if model:
-        prompts = scenario_def.get("llm_prompts") or []
-        if prompts and task_index is not None:
-            prompt = prompts[task_index % len(prompts)]
-        else:
-            prompt = scenario_def.get("llm_prompt", "Reply with OK.")
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": int(scenario_def.get("llm_max_tokens", 16)),
-        }
-        payload = json.dumps(body).encode()
-    else:
-        payload = b'{"messages":[]}'
-
-    headers = {"Content-Type": "application/json"}
+    raw = agent_desc.get("env") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("descriptor 'env' must be a table")
+    mock_base = f"http://127.0.0.1:{mock_port}/v1" if mock_port is not None else ""
+    mock_url = f"{mock_base}/chat/completions" if mock_base else ""
+    llm_url = str(scenario_def.get("llm_url") or scenario_def.get("mock_llm_url") or "")
+    llm_base = (
+        llm_url.rsplit("/chat/completions", 1)[0]
+        if llm_url.endswith("/chat/completions")
+        else llm_url
+    )
     key_env = scenario_def.get("llm_api_key_env")
+    values = {
+        "mock_base_url": mock_base,
+        "mock_url": mock_url,
+        "llm_url": llm_url,
+        "llm_base_url": llm_base,
+        # Copied from the harness environment into the candidate's env only; it
+        # is never written to a descriptor, scenario or record.
+        "llm_api_key": os.environ.get(key_env, "") if key_env else "",
+    }
+    resolved: dict[str, str] = {}
+    for key, value in raw.items():
+        text = str(value)
+        for name, replacement in values.items():
+            token = "{" + name + "}"
+            if token not in text:
+                continue
+            if not replacement:
+                raise ValueError(
+                    f"env {key} uses {token} but no value is available for it"
+                )
+            text = text.replace(token, replacement)
+        resolved[str(key)] = text
+    return resolved
+
+
+def _agent_target(
+    agent_desc: dict, scenario_def: dict, task_index: int | None = None
+) -> tuple[str, bytes, dict[str, str]]:
+    """The candidate's own chat endpoint, request body and headers (ticket #40).
+
+    Scenarios B-D drive the candidate, not its LLM: the harness POSTs here and
+    the candidate calls its configured upstream (the mock or the real provider).
+    ``chat_url`` is required; ``chat_api_key_env`` optionally supplies a bearer
+    token for the candidate's own API, read from the environment and never from
+    a descriptor or record.
+    """
+    url = agent_desc.get("chat_url")
+    if not url:
+        raise ValueError(
+            "descriptor has no 'chat_url': scenarios B-D need the candidate's "
+            "chat endpoint, not its LLM endpoint"
+        )
+    prompts = scenario_def.get("llm_prompts") or []
+    if prompts and task_index is not None:
+        prompt = prompts[task_index % len(prompts)]
+    else:
+        prompt = scenario_def.get("llm_prompt", "Reply with OK.")
+    body: dict[str, Any] = {
+        "model": scenario_def.get("llm_model") or "bench-model",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": int(scenario_def.get("llm_max_tokens", 16)),
+    }
+    headers = {"Content-Type": "application/json"}
+    key_env = agent_desc.get("chat_api_key_env")
     if key_env:
         key = os.environ.get(key_env)
         if key:
             headers["Authorization"] = f"Bearer {key}"
-    return url, payload, headers
+    headers.update(agent_desc.get("chat_headers") or {})
+    return str(url), json.dumps(body).encode(), headers
+
+
+def _scenario_requires_chat(scenario_def: dict) -> bool:
+    """True for scenarios that send requests to the candidate (B, C, D)."""
+    name = str(scenario_def.get("name", "")).lower()
+    return (
+        "scenario_b" in name
+        or "scenario_c" in name
+        or "scenario_d" in name
+        or scenario_def.get("requests") is not None
+        or scenario_def.get("restart_after_requests") is not None
+        or (
+            scenario_def.get("task_count") is not None
+            and scenario_def.get("repeats_per_task") is not None
+        )
+    )
+
+
+def _validate_chat_descriptor(agent_desc: dict, scenario_def: dict) -> str | None:
+    """Fail fast when a request scenario has no candidate endpoint (ticket #40)."""
+    if not _scenario_requires_chat(scenario_def):
+        return None
+    chat_url = agent_desc.get("chat_url")
+    if not chat_url:
+        return (
+            "descriptor has no 'chat_url': scenarios B-D send requests to the "
+            "candidate, so it needs its chat endpoint"
+        )
+    if not str(chat_url).startswith(("http://", "https://")):
+        return f"chat_url must be an http(s) URL, got {chat_url!r}"
+    return None
 
 
 def _docker_container_pid(docker_bin: str, name: str) -> int | None:
@@ -304,6 +376,7 @@ def _start_process_with_attempts(
     hc_value: str,
     hc_timeout: float,
     attempts: int = 1,
+    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Start the candidate and wait for its healthcheck, up to `attempts` times.
 
@@ -321,6 +394,9 @@ def _start_process_with_attempts(
     for attempt_idx in range(attempts):
         t_start = time.monotonic()
         started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        # A file healthcheck from the previous process must not make a process
+        # that has not started yet look healthy (found with scenario D restarts).
+        _clear_health_signal(hc_type, hc_value)
         try:
             proc = subprocess.Popen(
                 start_cmd,
@@ -328,6 +404,8 @@ def _start_process_with_attempts(
                 cwd=workdir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                # Candidate env, e.g. the mock/provider base URL (ticket #40).
+                env={**os.environ, **env} if env else None,
             )
         except OSError as exc:
             launch_error = f"{type(exc).__name__}: {exc}"
@@ -359,6 +437,15 @@ def _start_process_with_attempts(
     }
 
 
+def _clear_health_signal(hc_type: str, hc_value: str) -> None:
+    """Drop a stale file healthcheck before a (re)start."""
+    if hc_type == "file" and hc_value:
+        try:
+            Path(hc_value).unlink()
+        except OSError:
+            pass
+
+
 def _budget_guard(budget: int, issued: int) -> dict:
     return {
         "code": GUARD_EXIT_CODES["api_budget"],
@@ -371,7 +458,9 @@ def _meminfo_mb(meminfo: dict[str, float], key: str) -> float | None:
     return kb_to_mb(meminfo[key]) if key in meminfo else None
 
 
-def _prepare_candidate(agent_desc: dict, scenario_def: dict, proc_root: str) -> dict[str, Any]:
+def _prepare_candidate(
+    agent_desc: dict, scenario_def: dict, proc_root: str, mock_port: int | None = None
+) -> dict[str, Any]:
     """Resolve everything one repeat needs to start a candidate (ticket #36).
 
     Healthcheck parameters, absolute workdir, resolved start command, proc PID
@@ -404,6 +493,10 @@ def _prepare_candidate(agent_desc: dict, scenario_def: dict, proc_root: str) -> 
     mem_avail_kb = read_mem_available_kb(proc_root)
     ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
 
+    # Ticket #40: the candidate must talk to the mock/provider, so its address
+    # is resolved into the descriptor's declared env vars before the start.
+    candidate_env = _resolve_env(agent_desc, scenario_def, mock_port)
+
     return {
         "hc_type": hc_type,
         "hc_value": hc_value,
@@ -413,6 +506,7 @@ def _prepare_candidate(agent_desc: dict, scenario_def: dict, proc_root: str) -> 
         "start_cmd": start_cmd,
         "proc_pid_override": proc_pid_override,
         "ram_baseline_mb": ram_baseline_mb,
+        "env": candidate_env,
     }
 
 
@@ -430,6 +524,7 @@ def _start_candidate(prepared: dict, start_attempts: int) -> dict[str, Any]:
         prepared["hc_value"],
         prepared["hc_timeout"],
         start_attempts,
+        env=prepared.get("env"),
     )
     if started["proc"] is not None and not started["healthy"]:
         _terminate_proc(started["proc"])
@@ -588,10 +683,15 @@ def _run_single_repeat_scenario_b(
     mock_port: int | None,
     start_attempts: int = 1,
 ) -> dict[str, Any]:
-    """Execute one repeat of scenario B (mock LLM controlled requests)."""
+    """Execute one repeat of scenario B: controlled requests through the candidate.
+
+    Ticket #40: the requests go to the candidate's ``chat_url`` and the candidate
+    calls its configured upstream (mock server when one is up). Before the fix the
+    harness called the mock directly and the candidate only idled.
+    """
     duration_s = 0
     sample_interval = 1
-    prepared = _prepare_candidate(agent_desc, scenario_def, proc_root)
+    prepared = _prepare_candidate(agent_desc, scenario_def, proc_root, mock_port)
     proc_pid_override = prepared["proc_pid_override"]
     ram_baseline_mb = prepared["ram_baseline_mb"]
 
@@ -629,7 +729,7 @@ def _run_single_repeat_scenario_b(
     error_count = 0
     latencies_ms: list[float] = []
 
-    mock_llm_url, llm_payload, llm_headers = _llm_target(scenario_def, mock_port)
+    agent_url, request_payload, request_headers = _agent_target(agent_desc, scenario_def)
     request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
 
     # Tool cycles flag
@@ -655,15 +755,12 @@ def _run_single_repeat_scenario_b(
             rss_samples.append(kb_to_mb(rss))
 
         try:
-            if mock_llm_url:
-                req = urllib.request.Request(mock_llm_url, method="POST", data=llm_payload, headers=llm_headers)
-                with urllib.request.urlopen(req, timeout=request_timeout) as resp:
-                    _ = resp.read()
-                    ok = resp.status == 200
-            else:
-                # No mock, just sleep a bit
-                time.sleep(0.01)
-                ok = True
+            req = urllib.request.Request(
+                agent_url, method="POST", data=request_payload, headers=request_headers
+            )
+            with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+                _ = resp.read()
+                ok = resp.status == 200
         except Exception:
             ok = False
 
@@ -759,17 +856,19 @@ def _run_single_repeat_scenario_c(
     mock_port: int | None,
     start_attempts: int = 1,
 ) -> dict[str, Any]:
-    """Execute one repeat of scenario C (real LLM tasks, ticket #14).
+    """Execute one repeat of scenario C: the candidate performs the tasks.
 
-    Tasks run as requests against the mock LLM server when one is up
-    (mock_port includes 0 = OS-assigned). Without a mock server no request is
-    issued and all tasks are marked unfinished in the result.
+    Ticket #40: every task request goes to the candidate's chat endpoint; the
+    candidate talks to the mock or the real provider. Without a candidate
+    endpoint the run is rejected before it starts (see `_validate_chat_descriptor`).
+    The harness measures request success and latency; answer and artefact
+    correctness stay out of scope (METHODOLOGY §3 C, scenario comments).
     """
     task_count = int(scenario_def.get("task_count", 0))
     repeats_per_task = int(scenario_def.get("repeats_per_task", 0))
     total_tasks = task_count * repeats_per_task
 
-    prepared = _prepare_candidate(agent_desc, scenario_def, proc_root)
+    prepared = _prepare_candidate(agent_desc, scenario_def, proc_root, mock_port)
     proc_pid_override = prepared["proc_pid_override"]
     ram_baseline_mb = prepared["ram_baseline_mb"]
 
@@ -804,43 +903,41 @@ def _run_single_repeat_scenario_c(
     api_budget = scenario_def.get("guard_api_request_budget")
     guard = None
 
-    mock_llm_url, _, _ = _llm_target(scenario_def, mock_port)
-    if mock_llm_url is not None:
-        request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
-        for task in range(total_tasks):
-            if proc.poll() is not None:
-                guard = _health_guard()
-                break
-            _, llm_payload, llm_headers = _llm_target(scenario_def, mock_port, task)
-            pss = read_pss_kb(proc_root, sample_pid)
-            rss = read_rss_kb(proc_root, sample_pid)
-            if pss is not None:
-                pss_samples.append(kb_to_mb(pss))
-            if rss is not None:
-                rss_samples.append(kb_to_mb(rss))
+    request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
+    for task in range(total_tasks):
+        if proc.poll() is not None:
+            guard = _health_guard()
+            break
+        agent_url, task_payload, task_headers = _agent_target(agent_desc, scenario_def, task)
+        pss = read_pss_kb(proc_root, sample_pid)
+        rss = read_rss_kb(proc_root, sample_pid)
+        if pss is not None:
+            pss_samples.append(kb_to_mb(pss))
+        if rss is not None:
+            rss_samples.append(kb_to_mb(rss))
 
-            req_start = time.monotonic()
-            try:
-                req = urllib.request.Request(
-                    mock_llm_url, method="POST", data=llm_payload,
-                    headers=llm_headers,
-                )
-                with urllib.request.urlopen(req, timeout=request_timeout) as resp:
-                    _ = resp.read()
-                    ok = resp.status == 200
-            except Exception:
-                ok = False
-            latencies_ms.append((time.monotonic() - req_start) * 1000.0)
-            if ok:
-                success_count += 1
-            else:
-                error_count += 1
-            if api_budget is not None and success_count + error_count >= int(api_budget):
-                guard = _budget_guard(int(api_budget), success_count + error_count)
-                break
-            time.sleep(0.01)
+        req_start = time.monotonic()
+        try:
+            req = urllib.request.Request(
+                agent_url, method="POST", data=task_payload,
+                headers=task_headers,
+            )
+            with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+                _ = resp.read()
+                ok = resp.status == 200
+        except Exception:
+            ok = False
+        latencies_ms.append((time.monotonic() - req_start) * 1000.0)
+        if ok:
+            success_count += 1
+        else:
+            error_count += 1
+        if api_budget is not None and success_count + error_count >= int(api_budget):
+            guard = _budget_guard(int(api_budget), success_count + error_count)
+            break
+        time.sleep(0.01)
 
-    unfinished = total_tasks - success_count if mock_llm_url is not None else total_tasks
+    unfinished = total_tasks - success_count
 
     if proc.poll() is None:
         proc.terminate()
@@ -941,7 +1038,7 @@ def _run_single_repeat_scenario_d(
     request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
     api_budget = scenario_def.get("guard_api_request_budget")
 
-    prepared = _prepare_candidate(agent_desc, scenario_def, proc_root)
+    prepared = _prepare_candidate(agent_desc, scenario_def, proc_root, mock_port)
     workdir = prepared["workdir"]
     workdir_abs = prepared["workdir_abs"]
     start_cmd = prepared["start_cmd"]
@@ -984,7 +1081,10 @@ def _run_single_repeat_scenario_d(
     # by the mid-series restart is just as unfinished as one left at the end.
     seen_children: set[int] = set()
 
-    mock_llm_url, llm_payload, llm_headers = _llm_target(scenario_def, mock_port)
+    # Ticket #40: the series is driven through the candidate, so injected
+    # upstream errors (429/500/timeout) reach the candidate and its handling
+    # is what gets recorded.
+    agent_url, request_payload, request_headers = _agent_target(agent_desc, scenario_def)
 
     for i in range(total_requests):
         if proc.poll() is not None:
@@ -993,17 +1093,13 @@ def _run_single_repeat_scenario_d(
         req_start = time.monotonic()
         ok = False
         try:
-            if mock_llm_url:
-                req = urllib.request.Request(
-                    mock_llm_url, method="POST", data=llm_payload,
-                    headers=llm_headers,
-                )
-                with urllib.request.urlopen(req, timeout=request_timeout) as resp:
-                    _ = resp.read()
-                    ok = resp.status == 200
-            else:
-                time.sleep(0.01)
-                ok = True
+            req = urllib.request.Request(
+                agent_url, method="POST", data=request_payload,
+                headers=request_headers,
+            )
+            with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+                _ = resp.read()
+                ok = resp.status == 200
         except Exception:
             ok = False
         latencies_ms.append((time.monotonic() - req_start) * 1000.0)
@@ -1028,12 +1124,18 @@ def _run_single_repeat_scenario_d(
                     state_before = None
             seen_children.update(_child_pids(proc.pid))
             _terminate_proc(proc)
+            _clear_health_signal(hc_type, hc_value)
             proc = subprocess.Popen(
                 start_cmd,
                 shell=isinstance(start_cmd, str),
                 cwd=workdir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=(
+                    {**os.environ, **prepared["env"]}
+                    if prepared.get("env")
+                    else None
+                ),
             )
             healthy_again = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
             restart_state = "lost"
@@ -1156,6 +1258,10 @@ def _build_run_plan(
         "start_command": agent_desc.get("start_command"),
         "workdir": agent_desc.get("workdir"),
         "healthcheck": agent_desc.get("healthcheck"),
+        "chat_url": agent_desc.get("chat_url"),
+        "agent_env": _resolve_env(
+            agent_desc, scenario_def, getattr(args, "mock_llm_port", None)
+        ),
         "scenario": scenario_def.get("name", scenario_path.stem),
         "scenario_definition": str(scenario_path),
         "repeats": scenario_def.get("repeats", 3),
@@ -1207,8 +1313,18 @@ def _validate_docker_descriptor(agent_desc: dict) -> str | None:
     return None
 
 
-def _docker_run_flags(scenario_def: dict, run_id: str, agent_desc: dict) -> list[str]:
-    """Uniform, hardened docker run flags (identical limits for all candidates)."""
+def _docker_run_flags(
+    scenario_def: dict,
+    run_id: str,
+    agent_desc: dict,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Uniform, hardened docker run flags (identical limits for all candidates).
+
+    ``env`` carries the address of the mock/provider into the container (ticket
+    #40); it is resolved by the harness and never contains a secret read from a
+    descriptor.
+    """
     flags = [
         "--rm",
         f"--name=bench-{run_id}",
@@ -1223,6 +1339,8 @@ def _docker_run_flags(scenario_def: dict, run_id: str, agent_desc: dict) -> list
     cpus = scenario_def.get("docker_cpu_limit")
     if cpus:
         flags.append(f"--cpus={cpus}")
+    for key, value in (env or {}).items():
+        flags.extend(["-e", f"{key}={value}"])
     flags.extend(agent_desc.get("docker_args", []) or [])
     return flags
 
@@ -1302,6 +1420,13 @@ def cmd_run(args: Any) -> int:
         print(f"Error: {docker_error}", file=sys.stderr)
         return 1
 
+    # Ticket #40: B-D drive the candidate, so a descriptor without its own chat
+    # endpoint is rejected before anything is started or written.
+    chat_error = _validate_chat_descriptor(agent_desc, scenario_def)
+    if chat_error:
+        print(f"Error: {chat_error}", file=sys.stderr)
+        return 1
+
     # Dry-run (ticket #16): print the plan, spawn nothing, write nothing.
     if getattr(args, "dry_run", False):
         print(json.dumps(_build_run_plan(agent_path, scenario_path, agent_desc, scenario_def, args), indent=2))
@@ -1366,7 +1491,8 @@ def cmd_run(args: Any) -> int:
                     "record_path": str(run_dir / "record.jsonl"),
                 }, indent=2))
                 return GUARD_EXIT_CODES["unavailable"]
-            run_flags = _docker_run_flags(scenario_def, run_id, agent_desc)
+            container_env = _resolve_env(agent_desc, scenario_def, mock_port_num)
+            run_flags = _docker_run_flags(scenario_def, run_id, agent_desc, container_env)
             agent_desc = {
                 **agent_desc,
                 "container_name": f"bench-{run_id}",
@@ -1499,6 +1625,11 @@ def cmd_run(args: Any) -> int:
         # Scenario-specific notes (e.g. scenario D: rss growth, restart state)
         for r in repeat_results:
             notes_parts.extend(r.get("extra_notes") or [])
+        # Ticket #40 diagnostic: how many calls landed on the mock. With requests
+        # routed through the candidate this is the candidate's upstream traffic;
+        # zero next to non-zero success means the candidate ignored the mock.
+        if mock_server is not None:
+            notes_parts.append(f"mock_requests={mock_server.request_count}")
         if docker_image:
             notes_parts.append(f"runtime=docker")
             notes_parts.append(f"docker_image={docker_image}")

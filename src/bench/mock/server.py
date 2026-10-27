@@ -115,6 +115,7 @@ class MockLLMServer:
         self.httpd: HTTPServer | None = None
         self.thread: threading.Thread | None = None
         self._started = threading.Event()
+        self._handler_cls: type | None = None
 
     def start(self) -> int:
         handler_cls = type(
@@ -122,12 +123,18 @@ class MockLLMServer:
             (_Handler,),
             {"config": self.config, "counter": 0, "lock": threading.Lock()},
         )
+        self._handler_cls = handler_cls
         self.httpd = ThreadingHTTPServer((self.host, self.port), handler_cls)
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
         self._started.wait(timeout=1.0)
         return self.port
+
+    @property
+    def request_count(self) -> int:
+        """Calls the mock has answered (ticket #40 diagnostic and tests)."""
+        return int(getattr(self._handler_cls, "counter", 0)) if self._handler_cls else 0
 
     def stop(self) -> None:
         if self.httpd:
