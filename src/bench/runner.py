@@ -215,13 +215,15 @@ def _percentile(data: list[float], p: float) -> float:
     return data_sorted[f] * (c - k) + data_sorted[c] * (k - f)
 
 
-# Guard exit codes (ticket #16): distinct codes so an AFK run can be triaged
-# without a human. 0 ok, 1 usage/setup, 2 OOM, 3 MemAvailable, 4 health, 5 API budget.
+# Guard exit codes (ticket #16, extended by #29): distinct codes so an AFK run can be
+# triaged without a human. 0 ok, 1 usage/setup, 2 OOM, 3 MemAvailable, 4 health,
+# 5 API budget, 6 candidate unavailable (install_failed: never launchable in this mode).
 GUARD_EXIT_CODES = {
     "oom": 2,
     "memavailable": 3,
     "health": 4,
     "api_budget": 5,
+    "unavailable": 6,
 }
 
 
@@ -261,10 +263,98 @@ def _evaluate_guards(
     return None
 
 
-def _health_guard() -> dict:
+def _health_guard(reason: str = "healthcheck failed (limit reached)") -> dict:
     return {
         "code": GUARD_EXIT_CODES["health"],
-        "reason": "healthcheck failed (limit reached)",
+        "reason": reason,
+    }
+
+
+def _unavailable_guard(reason: str) -> dict:
+    """Guard 6: the candidate could not be launched in this mode (ticket #29).
+
+    A missing binary, a bad interpreter or an unpullable image is an install
+    failure, not a measurement: it is recorded, and the campaign moves on.
+    """
+    return {
+        "code": GUARD_EXIT_CODES["unavailable"],
+        "reason": f"install_failed={reason}",
+    }
+
+
+def _start_failure_guard(launch_error: str | None, attempts_used: int) -> dict:
+    """Guard for a start that never became healthy (ticket #29).
+
+    A launch error on the last attempt means the candidate could not be launched
+    at all (install failure, code 6). A candidate that ran but never answered its
+    healthcheck is a health failure (code 4) after `attempts_used` attempts.
+    """
+    if launch_error:
+        return _unavailable_guard(launch_error)
+    return _health_guard(
+        reason=f"healthcheck failed after {attempts_used} start attempt(s)"
+    )
+
+
+def _start_process_with_attempts(
+    start_cmd: Any,
+    workdir: str,
+    hc_type: str,
+    hc_value: str,
+    hc_timeout: float,
+    attempts: int = 1,
+) -> dict[str, Any]:
+    """Start the candidate and wait for its healthcheck, up to `attempts` times.
+
+    Ticket #29: a candidate that does not come up gets three start attempts before
+    its failure is recorded, and every failed attempt is stopped before the next
+    one begins, so no half-dead process is measured or left behind. Returns the
+    successful attempt's process and timings; when every attempt failed it returns
+    "proc": None plus the last launch error (an OSError means the command could not
+    even be executed: missing binary, wrong architecture, bad loader).
+    """
+    attempts = max(1, int(attempts))
+    launch_error: str | None = None
+    t_start = time.monotonic()
+    started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    for attempt_idx in range(attempts):
+        t_start = time.monotonic()
+        started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        try:
+            proc = subprocess.Popen(
+                start_cmd,
+                shell=isinstance(start_cmd, str),
+                cwd=workdir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            launch_error = f"{type(exc).__name__}: {exc}"
+            continue
+        launch_error = None
+        healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
+        if healthy:
+            return {
+                "proc": proc,
+                "pid": proc.pid,
+                "healthy": True,
+                "startup_ms": (time.monotonic() - t_start) * 1000.0,
+                "started_at_utc": started_at_utc,
+                "t_start": t_start,
+                "attempts_used": attempt_idx + 1,
+                "launch_error": None,
+            }
+        # Unhealthy attempt: stop it before the next one (no orphans, no leaks).
+        _terminate_proc(proc)
+    return {
+        "proc": None,
+        "pid": None,
+        "healthy": False,
+        "startup_ms": None,
+        "started_at_utc": started_at_utc,
+        "t_start": t_start,
+        "attempts_used": attempts,
+        "launch_error": launch_error,
     }
 
 
@@ -281,6 +371,7 @@ def _run_single_repeat_scenario_a(
     proc_root: str,
     cgroup_root: str,
     repeat_idx: int,
+    start_attempts: int = 1,
 ) -> dict[str, Any]:
     """Execute one repeat of scenario A (cold start / idle). Returns metrics dict."""
     # Cgroup path for agent; scenario/descriptor may define it for fixtures
@@ -327,29 +418,40 @@ def _run_single_repeat_scenario_a(
     mem_avail_kb = read_mem_available_kb(proc_root)
     ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
 
-    # Start process
-    t_start = time.monotonic()
-    started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-    proc = subprocess.Popen(
-        start_cmd,
-        shell=isinstance(start_cmd, str),
-        cwd=workdir,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    # Start process (ticket #29): up to start_attempts starts before the start is
+    # recorded as failed; the process of the successful attempt is the measured one.
+    started = _start_process_with_attempts(
+        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
     )
-    pid = proc.pid
-
-    # Wait for healthcheck; failure is the health guard (exit code 4)
-    healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
-    t_healthy = time.monotonic()
-    startup_ms = (t_healthy - t_start) * 1000.0 if healthy else None
+    proc = started["proc"]
+    t_start = started["t_start"]
+    started_at_utc = started["started_at_utc"]
+    healthy = started["healthy"]
+    startup_ms = started["startup_ms"]
+    if proc is None:
+        # Never launched in this mode: install failure, nothing to measure.
+        return {
+            "repeat": repeat_idx,
+            "startup_ms": None,
+            "ram_pss_mb_median": None,
+            "ram_peak_mb": None,
+            "ram_baseline_mb": ram_baseline_mb,
+            "duration_sec": 0.0,
+            "started_at_utc": started_at_utc,
+            "success": False,
+            "pss_samples": [],
+            "rss_samples": [],
+            "cpu_sec": None,
+            "oom_count": None,
+            "start_attempts_used": started["attempts_used"],
+            "guard": _start_failure_guard(started["launch_error"], started["attempts_used"]),
+        }
     sample_pid, cgroup_path = _sample_target(
         proc, agent_desc, proc_root, proc_pid_override, explicit_cgroup
     )
     guard = None
     if not healthy:
-        guard = _health_guard()
+        guard = _start_failure_guard(started["launch_error"], started["attempts_used"])
 
     # Sample PSS/RSS at 1-second intervals
     pss_samples: list[float] = []
@@ -419,6 +521,7 @@ def _run_single_repeat_scenario_a(
         "oom_count": oom_count,
         "cgroup_mem_peak_mb": mem_peak_mb,
         "cgroup_path": cgroup_path,
+        "start_attempts_used": started["attempts_used"],
         "guard": guard,
     }
 
@@ -430,6 +533,7 @@ def _run_single_repeat_scenario_b(
     cgroup_root: str,
     repeat_idx: int,
     mock_port: int | None,
+    start_attempts: int = 1,
 ) -> dict[str, Any]:
     """Execute one repeat of scenario B (mock LLM controlled requests)."""
     duration_s = 0
@@ -462,27 +566,17 @@ def _run_single_repeat_scenario_b(
     mem_avail_kb = read_mem_available_kb(proc_root)
     ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
 
-    t_start = time.monotonic()
-    started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-    proc = subprocess.Popen(
-        start_cmd,
-        shell=isinstance(start_cmd, str),
-        cwd=workdir,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    # Start process (ticket #29): up to start_attempts starts before the failure.
+    started = _start_process_with_attempts(
+        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
     )
-    pid = proc.pid
-
-    healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
-    if not healthy:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+    proc = started["proc"]
+    t_start = started["t_start"]
+    started_at_utc = started["started_at_utc"]
+    healthy = started["healthy"]
+    if proc is None or not healthy:
+        if proc is not None:
+            _terminate_proc(proc)
         return {
             "repeat": repeat_idx,
             "startup_ms": None,
@@ -498,11 +592,11 @@ def _run_single_repeat_scenario_b(
             "success_count": 0,
             "error_count": 0,
             "tool_cycles": None,
-            "guard": _health_guard(),
+            "start_attempts_used": started["attempts_used"],
+            "guard": _start_failure_guard(started["launch_error"], started["attempts_used"]),
         }
 
-    t_healthy = time.monotonic()
-    startup_ms = (t_healthy - t_start) * 1000.0
+    startup_ms = started["startup_ms"]
     sample_pid, _cgroup = _sample_target(
         proc, agent_desc, proc_root, proc_pid_override,
         scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path"),
@@ -622,6 +716,7 @@ def _run_single_repeat_scenario_b(
         "success_count": success_count,
         "error_count": error_count,
         "tool_cycles": tool_cycles_executed,
+        "start_attempts_used": started["attempts_used"],
         "guard": guard,
     }
 
@@ -648,6 +743,7 @@ def _run_single_repeat_scenario_c(
     cgroup_root: str,
     repeat_idx: int,
     mock_port: int | None,
+    start_attempts: int = 1,
 ) -> dict[str, Any]:
     """Execute one repeat of scenario C (real LLM tasks, ticket #14).
 
@@ -676,27 +772,17 @@ def _run_single_repeat_scenario_c(
     mem_avail_kb = read_mem_available_kb(proc_root)
     ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
 
-    started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    t_start = time.monotonic()
-
-    proc = subprocess.Popen(
-        start_cmd,
-        shell=isinstance(start_cmd, str),
-        cwd=workdir,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    # Start process (ticket #29): up to start_attempts starts before the failure.
+    started = _start_process_with_attempts(
+        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
     )
-    sample_pid = int(proc_pid_override) if proc_pid_override else proc.pid
-
-    healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
-    if not healthy:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+    proc = started["proc"]
+    t_start = started["t_start"]
+    started_at_utc = started["started_at_utc"]
+    healthy = started["healthy"]
+    if proc is None or not healthy:
+        if proc is not None:
+            _terminate_proc(proc)
         return {
             "repeat": repeat_idx,
             "startup_ms": None,
@@ -714,10 +800,12 @@ def _run_single_repeat_scenario_c(
             "success_count": 0,
             "error_count": 0,
             "unfinished_processes": total_tasks,
-            "guard": _health_guard(),
+            "start_attempts_used": started["attempts_used"],
+            "guard": _start_failure_guard(started["launch_error"], started["attempts_used"]),
         }
 
-    startup_ms = (time.monotonic() - t_start) * 1000.0
+    startup_ms = started["startup_ms"]
+    sample_pid = int(proc_pid_override) if proc_pid_override else proc.pid
     sample_pid, _cgroup = _sample_target(
         proc, agent_desc, proc_root, proc_pid_override,
         scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path"),
@@ -801,6 +889,7 @@ def _run_single_repeat_scenario_c(
         "success_count": success_count,
         "error_count": error_count,
         "unfinished_processes": unfinished,
+        "start_attempts_used": started["attempts_used"],
         "guard": guard,
     }
 
@@ -849,6 +938,7 @@ def _run_single_repeat_scenario_d(
     cgroup_root: str,
     repeat_idx: int,
     mock_port: int | None,
+    start_attempts: int = 1,
 ) -> dict[str, Any]:
     """Execute one repeat of scenario D: stability and recovery (ticket #15).
 
@@ -883,21 +973,17 @@ def _run_single_repeat_scenario_d(
     mem_avail_kb = read_mem_available_kb(proc_root)
     ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
 
-    started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    t_start = time.monotonic()
-
-    proc = subprocess.Popen(
-        start_cmd,
-        shell=isinstance(start_cmd, str),
-        cwd=workdir,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    # Start process (ticket #29): up to start_attempts starts before the failure.
+    started = _start_process_with_attempts(
+        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
     )
-    sample_pid = int(proc_pid_override) if proc_pid_override else proc.pid
-
-    healthy = _wait_for_healthcheck(hc_type, hc_value, hc_timeout)
-    if not healthy:
-        _terminate_proc(proc)
+    proc = started["proc"]
+    t_start = started["t_start"]
+    started_at_utc = started["started_at_utc"]
+    healthy = started["healthy"]
+    if proc is None or not healthy:
+        if proc is not None:
+            _terminate_proc(proc)
         return {
             "repeat": repeat_idx,
             "startup_ms": None,
@@ -916,10 +1002,12 @@ def _run_single_repeat_scenario_d(
             "error_count": 0,
             "unfinished_processes": 0,
             "extra_notes": [],
-            "guard": _health_guard(),
+            "start_attempts_used": started["attempts_used"],
+            "guard": _start_failure_guard(started["launch_error"], started["attempts_used"]),
         }
 
-    startup_ms = (time.monotonic() - t_start) * 1000.0
+    startup_ms = started["startup_ms"]
+    sample_pid = int(proc_pid_override) if proc_pid_override else proc.pid
     sample_pid, _cgroup = _sample_target(
         proc, agent_desc, proc_root, proc_pid_override,
         scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path"),
@@ -1053,6 +1141,7 @@ def _run_single_repeat_scenario_d(
         "error_count": error_count,
         "unfinished_processes": len(unfinished_pids),
         "extra_notes": extra_notes,
+        "start_attempts_used": started["attempts_used"],
         "guard": guard,
     }
 
@@ -1064,25 +1153,29 @@ def _run_single_repeat(
     cgroup_root: str,
     repeat_idx: int,
     mock_port: int | None,
+    start_attempts: int = 1,
 ) -> dict[str, Any]:
     """Execute one repeat, dispatching to B, C, D or A based on scenario definition."""
     scenario_name = scenario_def.get("name", "")
     # Scenario D: stability/recovery is identified before B (it also has "requests")
     if "scenario_d" in scenario_name.lower() or scenario_def.get("restart_after_requests"):
         return _run_single_repeat_scenario_d(
-            agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port
+            agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port,
+            start_attempts,
         )
     if "scenario_b" in scenario_name.lower() or scenario_def.get("requests"):
         return _run_single_repeat_scenario_b(
-            agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port
+            agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port,
+            start_attempts,
         )
     # Scenario C is identified by task_count + repeats_per_task (ticket #14)
     if scenario_def.get("task_count") is not None and scenario_def.get("repeats_per_task") is not None:
         return _run_single_repeat_scenario_c(
-            agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port
+            agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, mock_port,
+            start_attempts,
         )
     return _run_single_repeat_scenario_a(
-        agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx
+        agent_desc, scenario_def, proc_root, cgroup_root, repeat_idx, start_attempts
     )
 
 
@@ -1105,6 +1198,7 @@ def _build_run_plan(
         "scenario": scenario_def.get("name", scenario_path.stem),
         "scenario_definition": str(scenario_path),
         "repeats": scenario_def.get("repeats", 3),
+        "start_attempts": _resolve_start_attempts(agent_desc, scenario_def, args),
         "requests": scenario_def.get("requests"),
         "warmup_requests": scenario_def.get("warmup_requests"),
         "task_count": scenario_def.get("task_count"),
@@ -1172,6 +1266,58 @@ def _docker_run_flags(scenario_def: dict, run_id: str, agent_desc: dict) -> list
     return flags
 
 
+def _resolve_start_attempts(agent_desc: dict, scenario_def: dict, args: Any) -> int:
+    """Start attempts for one run (ticket #29): scenario, then descriptor, then CLI."""
+    raw = (
+        scenario_def.get("start_attempts")
+        or agent_desc.get("start_attempts")
+        or getattr(args, "start_attempts", None)
+        or 3
+    )
+    return max(1, int(raw))
+
+
+def _write_unavailable_record(
+    run_dir: Path,
+    run_id: str,
+    agent_path: Path,
+    agent_desc: dict,
+    scenario_def: dict,
+    scenario_path: Path,
+    reason: str,
+) -> dict:
+    """Record a candidate that could not be installed in this mode (ticket #29).
+
+    An unavailable mode is written as an install failure instead of being skipped
+    silently, so the report keeps its row and the campaign can tell "we ran it and
+    it failed" from "we never tried it".
+    """
+    record = _empty_record()
+    record["run_id"] = run_id
+    record["agent"] = agent_desc.get("name", agent_path.stem)
+    record["repo_url"] = agent_desc.get("repo_url")
+    record["version"] = agent_desc.get("version")
+    record["mode"] = agent_desc.get("mode")
+    record["scenario"] = scenario_def.get("name", scenario_path.stem)
+    record["started_at_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    record["duration_sec"] = 0.0
+    record["success_count"] = 0
+    record["error_count"] = 0
+    record["oom_count"] = 0
+    notes = [f"install_failed={reason}"]
+    if agent_desc.get("mode") == "docker":
+        notes.append("runtime=docker")
+        notes.append(f"docker_image={agent_desc.get('image')}")
+    record["notes"] = ", ".join(notes)
+    record["config_ref"] = str(scenario_path)
+    record, redacted = sanitize_record(record)
+    if redacted:
+        record["notes"] = ", ".join(filter(None, [record["notes"], SANITIZER_NOTE]))
+    with open(run_dir / "record.jsonl", "w") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
+
+
 def cmd_run(args: Any) -> int:
     """Execute the 'run' subcommand."""
     agent_path = Path(args.agent)
@@ -1186,6 +1332,9 @@ def cmd_run(args: Any) -> int:
 
     agent_desc = _load_toml(agent_path)
     scenario_def = _load_toml(scenario_path)
+    # Ticket #29: how many times a start may be attempted before the failure is
+    # recorded (scenario/descriptor override the CLI default of three).
+    start_attempts = _resolve_start_attempts(agent_desc, scenario_def, args)
 
     docker_error = _validate_docker_descriptor(agent_desc)
     if docker_error:
@@ -1234,8 +1383,26 @@ def cmd_run(args: Any) -> int:
                 capture_output=True, text=True, timeout=600,
             )
             if pull.returncode != 0:
-                print(f"Error: docker pull failed for {docker_image}: {pull.stderr.strip()}", file=sys.stderr)
-                return 1
+                # Ticket #29: an unpullable image is an install failure for this
+                # mode. It is recorded, not skipped, and the campaign moves on.
+                cause = pull.stderr.strip() or f"docker pull exit {pull.returncode}"
+                print(f"Error: install_failed: docker pull failed for {docker_image}: {cause}", file=sys.stderr)
+                _write_unavailable_record(
+                    run_dir=run_dir,
+                    run_id=run_id,
+                    agent_path=agent_path,
+                    agent_desc=agent_desc,
+                    scenario_def=scenario_def,
+                    scenario_path=scenario_path,
+                    reason=f"docker_pull_failed: {cause}",
+                )
+                print(json.dumps({
+                    "run_id": run_id,
+                    "status": "unavailable",
+                    "guard": _unavailable_guard(cause),
+                    "record_path": str(run_dir / "record.jsonl"),
+                }, indent=2))
+                return GUARD_EXIT_CODES["unavailable"]
             run_flags = _docker_run_flags(scenario_def, run_id, agent_desc)
             agent_desc = {
                 **agent_desc,
@@ -1257,6 +1424,7 @@ def cmd_run(args: Any) -> int:
                 cgroup_root=cgroup_root,
                 repeat_idx=i,
                 mock_port=mock_port_num,
+                start_attempts=start_attempts,
             )
             repeat_results.append(result)
             if result.get("guard"):
@@ -1321,6 +1489,11 @@ def cmd_run(args: Any) -> int:
         notes_parts = [
             f"repeats={num_repeats}",
         ]
+        # Ticket #29: surface how many start attempts the run needed (only when the
+        # candidate did not come up on the first try), so flaky starts stay visible.
+        start_attempts_used = max((r.get("start_attempts_used") or 1) for r in repeat_results)
+        if start_attempts_used > 1:
+            notes_parts.append(f"start_attempts_used={start_attempts_used}")
         if "task_count" in scenario_def:
             notes_parts.append(f"task_count={scenario_def['task_count']}")
         if "repeats_per_task" in scenario_def:
@@ -1390,9 +1563,18 @@ def cmd_run(args: Any) -> int:
                 row, _ = sanitize_record(row)
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+        if aborted_guard and aborted_guard["code"] == GUARD_EXIT_CODES["unavailable"]:
+            status = "unavailable"
+        elif aborted_guard:
+            status = "aborted"
+        elif any(r["success"] for r in repeat_results):
+            status = "ok"
+        else:
+            status = "failed"
+
         print(json.dumps({
             "run_id": run_id,
-            "status": "aborted" if aborted_guard else ("ok" if any(r["success"] for r in repeat_results) else "failed"),
+            "status": status,
             "guard": aborted_guard,
             "repeats": len(repeat_results),
             "startup_ms_median": statistics.median(startup_values) if startup_values else None,

@@ -193,6 +193,18 @@ Output: two tables (native / docker), per-candidate rows, latency percentiles, r
 | SSH tunnel drops | Use `autossh` or `screen`/`tmux` on Mac; verify before each candidate |
 | OOM on VM | Guard code 2 auto-stop; swap 4 GiB provides buffer |
 
+### Failure policy (wayfinder ticket #29)
+
+| Situation | What happens |
+|---|---|
+| Candidate never answers its healthcheck | Three start attempts (`--start-attempts 3`, the default); each failed attempt is stopped before the next starts. Still down → guard 4 with `start_attempts_used=3`, failure recorded, next candidate. |
+| Command cannot be launched at all (missing binary, glibc mismatch) | `install_failed` record, exit 6, no measurements; campaign continues. |
+| `docker pull` fails | `install_failed=docker_pull_failed` record, exit 6; the candidate's other mode still runs (#29 Q2). |
+| Guard trip mid-scenario (codes 2–5) | Partial record written as-is (`aborted=guardN`), **no retry**, campaign moves on. |
+| A scenario failed but the candidate is alive | Remaining scenarios still run; each failure is noted separately. |
+| SSH/VM unavailable, disk full | Campaign stops, state recorded; resume only on an explicit human "go". |
+| Candidate failed completely | Recorded in «Ограничения результата»; never substituted — the second wave (Hermes Agent) stays out of this effort. |
+
 ---
 
 ## 10. Post-Run
