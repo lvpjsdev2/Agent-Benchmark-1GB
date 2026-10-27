@@ -37,6 +37,7 @@
 | 7 | NullClaw | native + docker (partial) | nullclaw/nullclaw | nightly-2026-09-27 | `ghcr.io/nullclaw/nullclaw@sha256:c866ee2e1bddc93ac027ddcea5e028f2ebef8bd1ed61874596ca6f9de487d410` | `http://localhost:8080/health` |
 
 **Notes**:
+- **chat_url (ticket #40)**: each descriptor must name the candidate's own chat endpoint (`chat_url = "http://127.0.0.1:<api-port>/v1/chat/completions"`) and, where the agent reads its provider from env, an `env` map with `{mock_base_url}` / `{llm_url}`. Without it scenarios B–D refuse to start; verify the path against the candidate's API before the campaign, as was done for installs in #26.
 - **PicoClaw**: no official Docker image → native only.
 - **NullClaw**: partial run — only Scenario A (cold start) in both modes, marked "частичный прогон" in report.
 - **MicroClaw native**: install via `tar.gz` from GitHub Releases (`microclaw-0.11.1-x86_64-linux-gnu.tar.gz`); glibc ≥ 2.39 satisfied on Ubuntu 24.04.

@@ -1,7 +1,9 @@
-# Scenario C (METHODOLOGY §3 C): 4 fixed tasks x 5 repeats against a real
-# OpenAI-compatible endpoint. The API key is read from BENCH_LLM_API_KEY so it
-# never enters this file or any record. The harness measures request
-# success/latency and agent resource use; answer correctness is out of scope.
+# Scenario C (METHODOLOGY §3 C): 4 fixed tasks x 5 repeats. The harness sends
+# each task to the candidate's chat_url; the candidate calls the OpenAI-
+# compatible endpoint below through its descriptor env (ticket #40). The API key
+# is read from BENCH_LLM_API_KEY into the candidate env so it never enters this
+# file or any record. The harness measures request success/latency and agent
+# resource use; answer correctness is out of scope.
 name = "scenario_c_real_llm_tasks"
 task_count = 4
 repeats_per_task = 5
