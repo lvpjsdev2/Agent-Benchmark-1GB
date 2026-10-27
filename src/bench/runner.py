@@ -365,6 +365,103 @@ def _budget_guard(budget: int, issued: int) -> dict:
     }
 
 
+def _prepare_candidate(agent_desc: dict, scenario_def: dict, proc_root: str) -> dict[str, Any]:
+    """Resolve everything one repeat needs to start a candidate (ticket #36).
+
+    Healthcheck parameters, absolute workdir, resolved start command, proc PID
+    override and the RAM baseline. Before this helper the same block was copied
+    into all four scenario runners, so every start-policy change had to be made
+    four times (and the failure stubs had already drifted apart).
+    """
+    hc = agent_desc.get("healthcheck", {})
+    hc_type = hc.get("type", "file")
+    hc_value = hc.get("value", "")
+    workdir = agent_desc.get("workdir", "/tmp/bench-agent-workdir")
+
+    # Resolve relative paths against the harness cwd so descriptors are portable
+    # and healthcheck files land where the agent writes them. The agent is started
+    # from the workdir and receives workdir as an argument, so the healthcheck
+    # path and the agent's own workdir argument must be the same absolute path.
+    workdir_abs = str(Path(workdir).resolve())
+    if hc_type == "file" and hc_value:
+        hc_value = str(Path(hc_value).resolve())
+
+    start_cmd = _resolve_start_cmd(agent_desc["start_command"], workdir, workdir_abs)
+
+    # Fixture-only override: sample proc files under a fixed PID (e.g. a fixture
+    # proc tree keyed to PID 1000) instead of the real child PID, so CLI tests can
+    # assert on known values. Never set for real agents.
+    proc_pid_override = scenario_def.get("proc_pid_override") or agent_desc.get("proc_pid_override")
+
+    # Clean workdir before this repeat, then capture the RAM baseline
+    _cleanup_workdir(workdir_abs)
+    mem_avail_kb = read_mem_available_kb(proc_root)
+    ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
+
+    return {
+        "hc_type": hc_type,
+        "hc_value": hc_value,
+        "hc_timeout": hc.get("timeout_sec", 30),
+        "workdir": workdir,
+        "workdir_abs": workdir_abs,
+        "start_cmd": start_cmd,
+        "proc_pid_override": proc_pid_override,
+        "ram_baseline_mb": ram_baseline_mb,
+    }
+
+
+def _start_candidate(prepared: dict, start_attempts: int) -> dict[str, Any]:
+    """Start the candidate, stopping a process that never answered (ticket #29/#36).
+
+    Failed attempts are already stopped inside `_start_process_with_attempts`; a
+    process that came up but stayed unhealthy is stopped here too, so a repeat
+    either measures a healthy process or records a failed start.
+    """
+    started = _start_process_with_attempts(
+        prepared["start_cmd"],
+        prepared["workdir"],
+        prepared["hc_type"],
+        prepared["hc_value"],
+        prepared["hc_timeout"],
+        start_attempts,
+    )
+    if started["proc"] is not None and not started["healthy"]:
+        _terminate_proc(started["proc"])
+        started = {**started, "proc": None}
+    return started
+
+
+def _failed_start_result(
+    repeat_idx: int,
+    started: dict[str, Any],
+    ram_baseline_mb: float | None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Repeat result for a candidate that never came up (ticket #29/#36).
+
+    `extra` carries the keys the owning scenario returns on success, so a failed
+    start keeps the result shape of its scenario (the aggregate record and the
+    report read those keys).
+    """
+    result: dict[str, Any] = {
+        "repeat": repeat_idx,
+        "startup_ms": None,
+        "ram_pss_mb_median": None,
+        "ram_peak_mb": None,
+        "ram_baseline_mb": ram_baseline_mb,
+        "duration_sec": 0.0,
+        "started_at_utc": started["started_at_utc"],
+        "success": False,
+        "pss_samples": [],
+        "rss_samples": [],
+        "start_attempts_used": started["attempts_used"],
+        "guard": _start_failure_guard(started["launch_error"], started["attempts_used"]),
+    }
+    if extra:
+        result.update(extra)
+    return result
+
+
 def _run_single_repeat_scenario_a(
     agent_desc: dict,
     scenario_def: dict,
@@ -378,51 +475,13 @@ def _run_single_repeat_scenario_a(
     explicit_cgroup = scenario_def.get("cgroup_path") or agent_desc.get("cgroup_path")
     duration_s = scenario_def.get("duration_sec", 10)
     sample_interval = scenario_def.get("sample_interval_sec", 1)
-    hc = agent_desc.get("healthcheck", {})
-    hc_type = hc.get("type", "file")
-    hc_value = hc.get("value", "")
-    hc_timeout = hc.get("timeout_sec", 30)
-    workdir = agent_desc.get("workdir", "/tmp/bench-agent-workdir")
-    start_cmd = agent_desc["start_command"]
-    # Fixture-only override: sample proc files under a fixed PID (e.g. a fixture
-    # proc tree keyed to PID 1000) instead of the real child PID, so CLI tests can
-    # assert on known values. Never set for real agents.
-    proc_pid_override = scenario_def.get("proc_pid_override") or agent_desc.get("proc_pid_override")
-
-    # Resolve relative paths against the harness cwd so descriptors are portable
-    # and healthcheck files land where the agent writes them. The agent is started
-    # from the workdir and receives workdir as an argument, so the healthcheck
-    # path and the agent's own workdir argument must be the same absolute path.
-    workdir_abs = str(Path(workdir).resolve())
-    if hc_type == "file" and hc_value:
-        hc_value = str(Path(hc_value).resolve())
-
-    # Start command: resolve the script path and any workdir argument to absolute
-    # paths relative to the harness cwd (only for list-style commands; shell strings
-    # are left untouched and resolve relative to the workdir cwd at runtime).
-    if isinstance(start_cmd, list):
-        cmd_cwd = Path.cwd()
-        resolved_cmd: list[str] = []
-        for part in start_cmd:
-            if part == workdir:
-                resolved_cmd.append(workdir_abs)
-            else:
-                cand = cmd_cwd / part
-                resolved_cmd.append(str(cand) if cand.exists() else part)
-        start_cmd = resolved_cmd
-
-    # Clean workdir before this repeat
-    _cleanup_workdir(workdir_abs)
-
-    # Capture RAM baseline before starting the agent
-    mem_avail_kb = read_mem_available_kb(proc_root)
-    ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
+    prepared = _prepare_candidate(agent_desc, scenario_def, proc_root)
+    proc_pid_override = prepared["proc_pid_override"]
+    ram_baseline_mb = prepared["ram_baseline_mb"]
 
     # Start process (ticket #29): up to start_attempts starts before the start is
     # recorded as failed; the process of the successful attempt is the measured one.
-    started = _start_process_with_attempts(
-        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
-    )
+    started = _start_candidate(prepared, start_attempts)
     proc = started["proc"]
     t_start = started["t_start"]
     started_at_utc = started["started_at_utc"]
@@ -430,22 +489,10 @@ def _run_single_repeat_scenario_a(
     startup_ms = started["startup_ms"]
     if proc is None:
         # Never launched in this mode: install failure, nothing to measure.
-        return {
-            "repeat": repeat_idx,
-            "startup_ms": None,
-            "ram_pss_mb_median": None,
-            "ram_peak_mb": None,
-            "ram_baseline_mb": ram_baseline_mb,
-            "duration_sec": 0.0,
-            "started_at_utc": started_at_utc,
-            "success": False,
-            "pss_samples": [],
-            "rss_samples": [],
-            "cpu_sec": None,
-            "oom_count": None,
-            "start_attempts_used": started["attempts_used"],
-            "guard": _start_failure_guard(started["launch_error"], started["attempts_used"]),
-        }
+        return _failed_start_result(
+            repeat_idx, started, ram_baseline_mb,
+            extra={"cpu_sec": None, "oom_count": None},
+        )
     sample_pid, cgroup_path = _sample_target(
         proc, agent_desc, proc_root, proc_pid_override, explicit_cgroup
     )
@@ -538,63 +585,24 @@ def _run_single_repeat_scenario_b(
     """Execute one repeat of scenario B (mock LLM controlled requests)."""
     duration_s = 0
     sample_interval = 1
-    hc = agent_desc.get("healthcheck", {})
-    hc_type = hc.get("type", "file")
-    hc_value = hc.get("value", "")
-    hc_timeout = hc.get("timeout_sec", 30)
-    workdir = agent_desc.get("workdir", "/tmp/bench-agent-workdir")
-    start_cmd = agent_desc["start_command"]
-    proc_pid_override = scenario_def.get("proc_pid_override") or agent_desc.get("proc_pid_override")
-
-    workdir_abs = str(Path(workdir).resolve())
-    if hc_type == "file" and hc_value:
-        hc_value = str(Path(hc_value).resolve())
-
-    if isinstance(start_cmd, list):
-        cmd_cwd = Path.cwd()
-        resolved_cmd: list[str] = []
-        for part in start_cmd:
-            if part == workdir:
-                resolved_cmd.append(workdir_abs)
-            else:
-                cand = cmd_cwd / part
-                resolved_cmd.append(str(cand) if cand.exists() else part)
-        start_cmd = resolved_cmd
-
-    _cleanup_workdir(workdir_abs)
-
-    mem_avail_kb = read_mem_available_kb(proc_root)
-    ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
+    prepared = _prepare_candidate(agent_desc, scenario_def, proc_root)
+    proc_pid_override = prepared["proc_pid_override"]
+    ram_baseline_mb = prepared["ram_baseline_mb"]
 
     # Start process (ticket #29): up to start_attempts starts before the failure.
-    started = _start_process_with_attempts(
-        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
-    )
+    started = _start_candidate(prepared, start_attempts)
     proc = started["proc"]
     t_start = started["t_start"]
     started_at_utc = started["started_at_utc"]
     healthy = started["healthy"]
-    if proc is None or not healthy:
-        if proc is not None:
-            _terminate_proc(proc)
-        return {
-            "repeat": repeat_idx,
-            "startup_ms": None,
-            "ram_pss_mb_median": None,
-            "ram_peak_mb": None,
-            "ram_baseline_mb": ram_baseline_mb,
-            "duration_sec": 0.0,
-            "started_at_utc": started_at_utc,
-            "success": False,
-            "pss_samples": [],
-            "rss_samples": [],
-            "latencies_ms": [],
-            "success_count": 0,
-            "error_count": 0,
-            "tool_cycles": None,
-            "start_attempts_used": started["attempts_used"],
-            "guard": _start_failure_guard(started["launch_error"], started["attempts_used"]),
-        }
+    if proc is None:
+        return _failed_start_result(
+            repeat_idx, started, ram_baseline_mb,
+            extra={
+                "latencies_ms": [], "success_count": 0, "error_count": 0,
+                "tool_cycles": None,
+            },
+        )
 
     startup_ms = started["startup_ms"]
     sample_pid, _cgroup = _sample_target(
@@ -755,54 +763,25 @@ def _run_single_repeat_scenario_c(
     repeats_per_task = int(scenario_def.get("repeats_per_task", 0))
     total_tasks = task_count * repeats_per_task
 
-    hc = agent_desc.get("healthcheck", {})
-    hc_type = hc.get("type", "file")
-    hc_value = hc.get("value", "")
-    hc_timeout = hc.get("timeout_sec", 30)
-    workdir = agent_desc.get("workdir", "/tmp/bench-agent-workdir")
-    start_cmd = _resolve_start_cmd(agent_desc["start_command"], workdir, str(Path(workdir).resolve()))
-    proc_pid_override = scenario_def.get("proc_pid_override") or agent_desc.get("proc_pid_override")
-
-    workdir_abs = str(Path(workdir).resolve())
-    if hc_type == "file" and hc_value:
-        hc_value = str(Path(hc_value).resolve())
-
-    _cleanup_workdir(workdir_abs)
-
-    mem_avail_kb = read_mem_available_kb(proc_root)
-    ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
+    prepared = _prepare_candidate(agent_desc, scenario_def, proc_root)
+    proc_pid_override = prepared["proc_pid_override"]
+    ram_baseline_mb = prepared["ram_baseline_mb"]
 
     # Start process (ticket #29): up to start_attempts starts before the failure.
-    started = _start_process_with_attempts(
-        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
-    )
+    started = _start_candidate(prepared, start_attempts)
     proc = started["proc"]
     t_start = started["t_start"]
     started_at_utc = started["started_at_utc"]
     healthy = started["healthy"]
-    if proc is None or not healthy:
-        if proc is not None:
-            _terminate_proc(proc)
-        return {
-            "repeat": repeat_idx,
-            "startup_ms": None,
-            "ram_pss_mb_median": None,
-            "ram_peak_mb": None,
-            "ram_baseline_mb": ram_baseline_mb,
-            "duration_sec": 0.0,
-            "started_at_utc": started_at_utc,
-            "success": False,
-            "pss_samples": [],
-            "rss_samples": [],
-            "latencies_ms": [],
-            "latency_p50_ms": None,
-            "latency_p95_ms": None,
-            "success_count": 0,
-            "error_count": 0,
-            "unfinished_processes": total_tasks,
-            "start_attempts_used": started["attempts_used"],
-            "guard": _start_failure_guard(started["launch_error"], started["attempts_used"]),
-        }
+    if proc is None:
+        return _failed_start_result(
+            repeat_idx, started, ram_baseline_mb,
+            extra={
+                "latencies_ms": [], "latency_p50_ms": None, "latency_p95_ms": None,
+                "success_count": 0, "error_count": 0,
+                "unfinished_processes": total_tasks,
+            },
+        )
 
     startup_ms = started["startup_ms"]
     sample_pid = int(proc_pid_override) if proc_pid_override else proc.pid
@@ -956,55 +935,31 @@ def _run_single_repeat_scenario_d(
     request_timeout = float(scenario_def.get("request_timeout_sec", 5.0))
     api_budget = scenario_def.get("guard_api_request_budget")
 
-    hc = agent_desc.get("healthcheck", {})
-    hc_type = hc.get("type", "file")
-    hc_value = hc.get("value", "")
-    hc_timeout = hc.get("timeout_sec", 30)
-    workdir = agent_desc.get("workdir", "/tmp/bench-agent-workdir")
-    start_cmd = _resolve_start_cmd(agent_desc["start_command"], workdir, str(Path(workdir).resolve()))
-    proc_pid_override = scenario_def.get("proc_pid_override") or agent_desc.get("proc_pid_override")
-
-    workdir_abs = str(Path(workdir).resolve())
-    if hc_type == "file" and hc_value:
-        hc_value = str(Path(hc_value).resolve())
-
-    _cleanup_workdir(workdir_abs)
-
-    mem_avail_kb = read_mem_available_kb(proc_root)
-    ram_baseline_mb = kb_to_mb(mem_avail_kb) if mem_avail_kb is not None else None
+    prepared = _prepare_candidate(agent_desc, scenario_def, proc_root)
+    workdir = prepared["workdir"]
+    workdir_abs = prepared["workdir_abs"]
+    start_cmd = prepared["start_cmd"]
+    hc_type = prepared["hc_type"]
+    hc_value = prepared["hc_value"]
+    hc_timeout = prepared["hc_timeout"]
+    proc_pid_override = prepared["proc_pid_override"]
+    ram_baseline_mb = prepared["ram_baseline_mb"]
 
     # Start process (ticket #29): up to start_attempts starts before the failure.
-    started = _start_process_with_attempts(
-        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
-    )
+    started = _start_candidate(prepared, start_attempts)
     proc = started["proc"]
     t_start = started["t_start"]
     started_at_utc = started["started_at_utc"]
     healthy = started["healthy"]
-    if proc is None or not healthy:
-        if proc is not None:
-            _terminate_proc(proc)
-        return {
-            "repeat": repeat_idx,
-            "startup_ms": None,
-            "ram_pss_mb_median": None,
-            "ram_peak_mb": None,
-            "ram_baseline_mb": ram_baseline_mb,
-            "duration_sec": 0.0,
-            "started_at_utc": started_at_utc,
-            "success": False,
-            "pss_samples": [],
-            "rss_samples": [],
-            "latencies_ms": [],
-            "latency_p50_ms": None,
-            "latency_p95_ms": None,
-            "success_count": 0,
-            "error_count": 0,
-            "unfinished_processes": 0,
-            "extra_notes": [],
-            "start_attempts_used": started["attempts_used"],
-            "guard": _start_failure_guard(started["launch_error"], started["attempts_used"]),
-        }
+    if proc is None:
+        return _failed_start_result(
+            repeat_idx, started, ram_baseline_mb,
+            extra={
+                "latencies_ms": [], "latency_p50_ms": None, "latency_p95_ms": None,
+                "success_count": 0, "error_count": 0,
+                "unfinished_processes": 0, "extra_notes": [],
+            },
+        )
 
     startup_ms = started["startup_ms"]
     sample_pid = int(proc_pid_override) if proc_pid_override else proc.pid
