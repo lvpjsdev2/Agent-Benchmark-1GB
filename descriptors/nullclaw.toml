@@ -1,0 +1,12 @@
+# Partial run: install + scenario A only (map decision #28).
+name = "NullClaw"
+repo_url = "https://github.com/nullclaw/nullclaw"
+version = "v2026.5.29"
+mode = "native"
+start_command = ["nullclaw", "gateway", "-p", "8080"]
+workdir = "/tmp/bench-wd/nullclaw"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:8080/health"
+timeout_sec = 60

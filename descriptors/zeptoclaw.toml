@@ -1,0 +1,13 @@
+# ZeptoClaw native (panel API server). Config is provisioned at ~/.zeptoclaw/config.json
+# by scripts/provision_vm.sh; the harness only wipes workdir, never the config.
+name = "ZeptoClaw"
+repo_url = "https://github.com/qhkm/zeptoclaw"
+version = "0.9.2"
+mode = "native"
+start_command = ["zeptoclaw", "panel", "--api-only", "--api-port", "9091", "--port", "9092"]
+workdir = "/tmp/bench-wd/zeptoclaw"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:9091/api/health"
+timeout_sec = 60

@@ -1,0 +1,14 @@
+# Moltis serves HTTPS by default; --no-tls keeps the harness healthcheck simple.
+name = "Moltis"
+repo_url = "https://github.com/moltis-org/moltis"
+version = "20261023.01"
+mode = "docker"
+image = "ghcr.io/moltis-org/moltis@sha256:17cdb294521954ca0c4af37531018f79058138bdfc7b1bd5382a7a3027b3b4fd"
+start_command = ["gateway", "--bind", "0.0.0.0", "--port", "13131", "--no-tls"]
+docker_args = ["-p", "127.0.0.1:13131:13131"]
+workdir = "/tmp/bench-wd/moltis_docker"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:13131/health"
+timeout_sec = 60

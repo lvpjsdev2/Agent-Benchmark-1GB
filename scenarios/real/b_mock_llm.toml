@@ -1,0 +1,13 @@
+# Scenario B (METHODOLOGY §3 B): 30 controlled requests + 5 warmup against the
+# harness mock server (--mock-llm-port 0), fixed 50 ms latency.
+name = "scenario_b_mock_llm_controlled"
+requests = 30
+warmup_requests = 5
+repeats = 1
+mock_latency_ms = 50
+tool_cycles = 10
+guard_api_request_budget = 200
+guard_oom_threshold = 1
+guard_memavailable_min_mb = 100
+docker_memory_limit = "512m"
+docker_cpu_limit = "1.0"

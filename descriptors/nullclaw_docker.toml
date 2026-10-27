@@ -1,0 +1,17 @@
+# Partial run: install + scenario A only (map decision #28).
+name = "NullClaw"
+repo_url = "https://github.com/nullclaw/nullclaw"
+version = "v2026.5.29"
+mode = "docker"
+image = "ghcr.io/nullclaw/nullclaw@sha256:c866ee2e1bddc93ac027ddcea5e028f2ebef8bd1ed61874596ca6f9de487d410"
+start_command = ["gateway", "-p", "8080"]
+docker_args = [
+  "-v", "/home/ubuntu/bench-config/nullclaw:/data/.nullclaw:ro",
+  "-p", "127.0.0.1:8080:8080",
+]
+workdir = "/tmp/bench-wd/nullclaw_docker"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:8080/health"
+timeout_sec = 60

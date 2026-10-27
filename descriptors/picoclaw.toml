@@ -1,0 +1,11 @@
+name = "PicoClaw"
+repo_url = "https://github.com/sipeed/picoclaw"
+version = "0.3.1"
+mode = "native"
+start_command = ["picoclaw", "gateway", "--allow-empty", "--host", "127.0.0.1"]
+workdir = "/tmp/bench-wd/picoclaw"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:18790/health"
+timeout_sec = 60

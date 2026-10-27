@@ -1,0 +1,11 @@
+name = "ZeroClaw"
+repo_url = "https://github.com/zeroclaw-labs/zeroclaw"
+version = "0.8.6"
+mode = "native"
+start_command = ["zeroclaw", "gateway", "start", "-p", "8080"]
+workdir = "/tmp/bench-wd/zeroclaw"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:8080/health"
+timeout_sec = 60

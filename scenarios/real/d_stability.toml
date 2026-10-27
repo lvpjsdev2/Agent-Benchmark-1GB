@@ -1,0 +1,15 @@
+# Scenario D (METHODOLOGY §3 D): 100 sequential requests, agent restart at 50,
+# test-state preservation check, RSS growth and orphan detection.
+name = "scenario_d_stability_recovery"
+requests = 100
+warmup_requests = 0
+repeats = 1
+mock_latency_ms = 20
+pause_between_ms = 10
+restart_after_requests = 50
+test_state_file = "test_state.json"
+guard_api_request_budget = 200
+guard_oom_threshold = 1
+guard_memavailable_min_mb = 100
+docker_memory_limit = "512m"
+docker_cpu_limit = "1.0"

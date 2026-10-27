@@ -1,0 +1,13 @@
+name = "ZeroClaw"
+repo_url = "https://github.com/zeroclaw-labs/zeroclaw"
+version = "0.8.6"
+mode = "docker"
+image = "ghcr.io/zeroclaw-labs/zeroclaw@sha256:e44308c7120a32f1089e3bc2881159bfdf462e1281d2be40920f15de9202f752"
+start_command = ["daemon", "-p", "8080"]
+docker_args = ["-p", "127.0.0.1:8080:8080"]
+workdir = "/tmp/bench-wd/zeroclaw_docker"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:8080/health"
+timeout_sec = 60

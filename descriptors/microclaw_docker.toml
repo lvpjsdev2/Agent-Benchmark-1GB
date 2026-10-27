@@ -1,0 +1,16 @@
+name = "MicroClaw"
+repo_url = "https://github.com/microclaw/microclaw"
+version = "0.11.1"
+mode = "docker"
+image = "ghcr.io/microclaw/microclaw@sha256:f91f92bfadadeb5a584ba959e49615cb447d55a7eda1e6a78c384eb6d0da89dc"
+start_command = ["--config", "/cfg/microclaw.config.yaml", "start"]
+docker_args = [
+  "-v", "/home/ubuntu/bench-config/microclaw-docker:/cfg",
+  "-p", "127.0.0.1:10961:10961",
+]
+workdir = "/tmp/bench-wd/microclaw_docker"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:10961/health"
+timeout_sec = 60

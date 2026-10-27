@@ -1,0 +1,14 @@
+# Picobot ships no native Linux installer flow used here; docker is its supported mode.
+name = "Picobot"
+repo_url = "https://github.com/louisho5/picobot"
+version = "0.3.0"
+mode = "docker"
+image = "louisho5/picobot@sha256:8210fbfbcf86a929a692b11cd0f4bbf7d0ed16388652dd481c4486dc63c32b0d"
+start_command = ["gateway"]
+docker_args = ["-p", "127.0.0.1:18790:18790"]
+workdir = "/tmp/bench-wd/picobot_docker"
+
+[healthcheck]
+type = "http"
+value = "http://127.0.0.1:18790/health"
+timeout_sec = 60

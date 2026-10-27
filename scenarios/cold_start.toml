@@ -1,0 +1,8 @@
+name = "scenario_a_cold_start"
+duration_sec = 3
+sample_interval_sec = 1
+repeats = 3
+# Fixture-only: sample proc files under PID 1000 (tests/fixtures/proc/1000) so
+# CLI tests assert on known values. Real agents never set this.
+proc_pid_override = 1000
+cgroup_path = "v2/agent"

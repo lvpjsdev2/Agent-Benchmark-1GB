@@ -1,0 +1,24 @@
+name = "scenario_d_stability_recovery"
+# Scenario D: Stability and recovery
+# 100 sequential mock requests with a small pause — check for leaks (RSS growth)
+# and unfinished processes; agent restart with test state preservation;
+# simulation of API errors (429, 500, timeout) with controlled retry/handling.
+
+requests = 100
+warmup_requests = 0
+repeats = 1
+mock_latency_ms = 20
+# Error mode can be: None, "429", "500", "timeout" — injected per-call via mock server
+mock_error_mode = None
+# Small pause between requests (seconds)
+pause_between_ms = 10
+# If set, the mock server will inject errors on specific call numbers
+error_on_call = None
+
+# Agent restart settings: after N requests, restart the agent and check test state preservation
+restart_after_requests = 50
+# Test state file that the agent should save/restart with
+test_state_file = "test_state.json"
+
+# Notes: success/error counts, RSS growth flag, unfinished processes count
+notes_fields = ["success_count", "error_count", "rss_growth_mb", "unfinished_processes"]

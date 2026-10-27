@@ -1,0 +1,10 @@
+# Scenario A on the real VM (METHODOLOGY §3 A): 10 min at 1 s, 3 repeats.
+# No fixture overrides: PID and cgroup path are resolved from /proc by the harness.
+name = "scenario_a_cold_start"
+duration_sec = 600
+sample_interval_sec = 1
+repeats = 3
+guard_oom_threshold = 1
+guard_memavailable_min_mb = 100
+docker_memory_limit = "512m"
+docker_cpu_limit = "1.0"

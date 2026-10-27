@@ -1,0 +1,7 @@
+name = "scenario_b_mock_llm_controlled"
+requests = 30
+warmup_requests = 5
+repeats = 1
+mock_latency_ms = 50
+tool_cycles = 10
+proc_pid_override = 1000
