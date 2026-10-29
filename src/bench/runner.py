@@ -303,6 +303,7 @@ def _start_process_with_attempts(
     hc_value: str,
     hc_timeout: float,
     attempts: int = 1,
+    agent_desc: dict | None = None,
 ) -> dict[str, Any]:
     """Start the candidate and wait for its healthcheck, up to `attempts` times.
 
@@ -346,6 +347,8 @@ def _start_process_with_attempts(
             }
         # Unhealthy attempt: stop it before the next one (no orphans, no leaks).
         _terminate_proc(proc)
+        if agent_desc:
+            _docker_rm_f(agent_desc)
     return {
         "proc": None,
         "pid": None,
@@ -421,7 +424,8 @@ def _run_single_repeat_scenario_a(
     # Start process (ticket #29): up to start_attempts starts before the start is
     # recorded as failed; the process of the successful attempt is the measured one.
     started = _start_process_with_attempts(
-        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
+        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts,
+        agent_desc=agent_desc,
     )
     proc = started["proc"]
     t_start = started["t_start"]
@@ -484,6 +488,7 @@ def _run_single_repeat_scenario_a(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+    _docker_rm_f(agent_desc)
 
     # Compute metrics
     pss_median = statistics.median(pss_samples) if pss_samples else None
@@ -568,7 +573,8 @@ def _run_single_repeat_scenario_b(
 
     # Start process (ticket #29): up to start_attempts starts before the failure.
     started = _start_process_with_attempts(
-        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
+        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts,
+        agent_desc=agent_desc,
     )
     proc = started["proc"]
     t_start = started["t_start"]
@@ -774,7 +780,8 @@ def _run_single_repeat_scenario_c(
 
     # Start process (ticket #29): up to start_attempts starts before the failure.
     started = _start_process_with_attempts(
-        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
+        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts,
+        agent_desc=agent_desc,
     )
     proc = started["proc"]
     t_start = started["t_start"]
@@ -931,6 +938,23 @@ def _terminate_proc(proc: subprocess.Popen) -> None:
             proc.wait()
 
 
+def _docker_rm_f(agent_desc: dict) -> None:
+    """Force-remove the run's container after its docker-run CLI is stopped.
+
+    Killing the CLI (SIGTERM proxy or SIGKILL) does not reliably stop the
+    container: it can keep the name and the mapped port busy, so a restarted
+    or retried `docker run --name=bench-<run_id>` fails immediately.
+    """
+    name = agent_desc.get("container_name")
+    if not name:
+        return
+    docker_bin = agent_desc.get("docker_bin", "docker")
+    try:
+        subprocess.run([docker_bin, "rm", "-f", name], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _run_single_repeat_scenario_d(
     agent_desc: dict,
     scenario_def: dict,
@@ -975,7 +999,8 @@ def _run_single_repeat_scenario_d(
 
     # Start process (ticket #29): up to start_attempts starts before the failure.
     started = _start_process_with_attempts(
-        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts
+        start_cmd, workdir, hc_type, hc_value, hc_timeout, start_attempts,
+        agent_desc=agent_desc,
     )
     proc = started["proc"]
     t_start = started["t_start"]
@@ -1067,6 +1092,7 @@ def _run_single_repeat_scenario_d(
                     state_before = None
             seen_children.update(_child_pids(proc.pid))
             _terminate_proc(proc)
+            _docker_rm_f(agent_desc)
             proc = subprocess.Popen(
                 start_cmd,
                 shell=isinstance(start_cmd, str),
@@ -1100,6 +1126,7 @@ def _run_single_repeat_scenario_d(
     # instance ran, still alive after the last agent was terminated.
     seen_children.update(_child_pids(proc.pid))
     _terminate_proc(proc)
+    _docker_rm_f(agent_desc)
     unfinished_pids = sorted(p for p in seen_children if _pid_alive(p))
     # Hygiene for real runs: don't leave hung children behind
     for p in unfinished_pids:
