@@ -13,6 +13,9 @@ docker_args = [
   "--cap-add=SETUID",
   "--cap-add=SETGID",
   "-p", "127.0.0.1:9090:9090",
+  # The health server binds 127.0.0.1 by default (ZEPTOCLAW_HEALTH_HOST),
+  # which is unreachable through the port mapping.
+  "-e", "ZEPTOCLAW_HEALTH_HOST=0.0.0.0",
   # The image entrypoint chowns /data before starting; read-only mounts make
   # the container exit before its health server is available.
   "-v", "/home/ubuntu/bench-config/zeptoclaw:/data/.zeptoclaw",
