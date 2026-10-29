@@ -13,7 +13,7 @@
 | # | Кандидат | Mode | A (cold start) | B (mock LLM) | C (real LLM) | D (stability) | Статус | Run ID / заметки |
 |---|---|---|---|---|---|---|---|---|
 | 1 | ZeptoClaw 0.9.2 | native | ☑ | ☑ | ☑ | ☑ | готов | A `1c1aa4d8` 3/3 ok; B `96d71e68` 30/30 p50=52мс; C `2ba9c95c` 20/20 ok; D `3f954b3f` 100/100, restart_state=lost |
-| 1 | ZeptoClaw 0.9.2 | docker | ☐ | ☐ | ☐ | ☐ | не начат | |
+| 1 | ZeptoClaw 0.9.2 | docker | ☑ | ☑ | ☑ | ☑ | готов | A `cb3e1ee8` 3/3; B `d1007348` 30/30; C `4e630b06` 20/20; D `e11fb11a` 100/100, restart_state=lost (после фикса харнеса: docker rm -f при рестарте) |
 | 2 | ZeroClaw 0.8.6 | native | ☐ | ☐ | ☐ | ☐ | не начат | |
 | 2 | ZeroClaw 0.8.6 | docker | ☐ | ☐ | ☐ | ☐ | не начат | |
 | 3 | Picobot 0.3.0 | docker | ☐ | ☐ | ☐ | ☐ | не начат | |

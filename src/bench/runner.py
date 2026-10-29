@@ -136,12 +136,18 @@ def _llm_target(
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": int(scenario_def.get("llm_max_tokens", 16)),
+            # FreeLLMAPI rejects requests without an explicit streaming flag
+            # ("Invalid request: Required"), so always request non-streaming.
+            "stream": False,
         }
         payload = json.dumps(body).encode()
     else:
         payload = b'{"messages":[]}'
 
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    }
     key_env = scenario_def.get("llm_api_key_env")
     if key_env:
         key = os.environ.get(key_env)
